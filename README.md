@@ -35,6 +35,9 @@ to the exact tag and says so.
 
 ## Actions
 
+The **? Help** button in the header opens an in-app explanation of every column, action and the
+comparison levels — the same content as below, for whoever is looking at the dashboard.
+
 | action | what it does |
 |---|---|
 | **Check now** | Re-reads the Docker daemon and asks each registry for the current digest of the tag. Pulls nothing, changes nothing. |
