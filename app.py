@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.8.0"
+VERSION = "2.8.1"
 APP_NAME = "coolify-updates-manager"
 
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -1331,6 +1331,11 @@ PAGE = r"""<!doctype html>
 
       <h3>Good to Know</h3>
       <div class="doc">
+        <p><b>Two credentials, two jobs.</b> The Docker socket answers "what am I running": it is the only source
+          of the running image digest, of the image version label, and it pulls the image before a redeploy. The
+          Coolify token answers "which resource is this and may I redeploy it": it validates the resource uuid,
+          triggers the deploy and reports progress. Without the socket nothing can be compared against (only tag
+          drift); without the token the panel is read-only.</p>
         <p>Deploying never rewrites the compose. To pin a version, take it from <b>Target</b> or from
           <b>exact tag</b> and edit the compose yourself.</p>
         <p>Docker Hub limits anonymous manifest requests (100 per 6&nbsp;h per IP). A full check spends one request

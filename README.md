@@ -22,6 +22,49 @@ calls `POST /api/v1/deploy?uuid=<uuid>&force=false`.
 
 Single-file Python app (standard library only), one Dockerfile, one compose file.
 
+## Why it needs two credentials
+
+The panel answers questions that live in two different places. Neither source can
+answer the other's half.
+
+| question | comes from | why not the other source |
+|---|---|---|
+| Is the running image the one the tag points to today? | **Docker socket** | the digest of the running image only exists in the Docker daemon; the Coolify API exposes resource *configuration*, never container digests |
+| Which tag should I pin, and is the line newer? | registry (public, no credentials) | — |
+| Which Coolify resource owns this container, and may I redeploy it? | **Coolify token** | the socket knows the container, not the resource lifecycle (deploy, status, validation) |
+| Does the redeploy actually pull a new image? | socket (pull) **and** token (deploy) | Coolify's API deploy for services recreates containers without pulling |
+
+### Docker socket
+
+Used for:
+
+- enumerating containers with their image reference and `RepoDigests` — the
+  "running" side of every comparison;
+- image labels (`org.opencontainers.image.version`) and creation date shown in the
+  *in use* column;
+- container labels: `coolify.resourceName` / `com.docker.compose.project` to map a
+  container to a resource, and Traefik `Host(...)` for the address behind the
+  resource link;
+- `POST /images/create` to pull the image before asking Coolify to redeploy.
+
+Without it there is nothing to compare against: the state column cannot say
+`UPDATE` or `ok`, the version column is empty, and service deploys would recreate
+containers from the cached image. The panel degrades to a tag monitor.
+
+### Coolify token
+
+Used for:
+
+- `GET /applications`, `/services`, `/databases`: the authoritative resource list,
+  used to **validate** the uuid found in container labels (containers can keep a
+  stale project label after their application is recreated);
+- `POST /deploy`: the action behind the update button;
+- `GET /deployments/{uuid}`: deploy progress for applications;
+- `GET /services/{uuid}`: image references and domains of service containers.
+
+Abilities: **`read` + `deploy`**. `write` is not used. With no token the dashboard
+runs read-only (updates are reported, buttons hidden, `/api/deploy` answers `503`).
+
 ## The listing
 
 | column | meaning |
@@ -63,10 +106,10 @@ Everything is optional; the defaults give you a read-only dashboard.
 
 | variable | default | required for | description |
 |---|---|---|---|
-| `COOLIFY_TOKEN` | — | deploy buttons | Coolify API token with the `deploy` ability. Empty = read-only mode |
+| `COOLIFY_TOKEN` | — | deploy buttons | Coolify API token with `read` + `deploy`. Empty = read-only mode |
 | `COOLIFY_API_URL` | `http://host.docker.internal:8000` | deploy buttons | Coolify API base URL as seen **from inside the container** |
 | `COOLIFY_UI_URL` | — | links in the progress dialog | Coolify UI base (e.g. `https://coolify.example.com`) used to build "open in Coolify" links |
-| `DOCKER_SOCK` | `/var/run/docker.sock` | always | path to the Docker socket *inside the container* |
+| `DOCKER_SOCK` | `/var/run/docker.sock` | always | path to the Docker socket *inside the container* — the only source of the running image digest |
 | `UPDATES_STATE` | `/data/state.json` | — | where the last result is cached (mount a volume) |
 | `UPDATES_PORT` | `8799` | — | listening port |
 | `UPDATES_BIND` | `0.0.0.0` | — | listening address |

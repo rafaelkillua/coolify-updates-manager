@@ -83,6 +83,35 @@ Rules:
 - Published state is a file (`/data/state.json` by default): treat it as a cache,
   never as the source of truth.
 
+## Dependencies: why both the socket and the token
+
+Do not "simplify" this away — the two credentials cover disjoint halves of the
+problem, and dropping either one silently degrades the product.
+
+| need | socket | token |
+|---|---|---|
+| digest of the **running** image (the whole point of the `UPDATE`/`ok` column) | yes — the Coolify API has no container or image data | no |
+| image version label, creation date | yes | no |
+| container → resource mapping and Traefik `Host(...)` | yes (labels) | partly (`applications[].fqdn`) |
+| validating that a uuid is a real resource | no | yes (`/applications`, `/services`, `/databases`) |
+| pulling the image before a redeploy | yes (`POST /images/create`) | no |
+| triggering and following a deploy | no | yes |
+
+Consequences to keep in mind:
+
+- **Without the socket** there is nothing to compare against. The honest output is
+  "tag drift" (digest changed since the last observation), never `UPDATE`/`ok` based
+  on the running container. Version columns must stay empty, not be guessed.
+- **Without the token** the panel is read-only: no resource validation (uuids come
+  from labels only), no deploy, no progress. Keep that mode working — it is how the
+  app is tested without a Coolify instance.
+- **Services need both at once**: the token triggers the redeploy, but Coolify's API
+  deploy does not pull, so without the socket the container comes back on the old
+  image and the version never changes.
+- Token abilities are `read` + `deploy`; `write` is not required and asking for it
+  would be wrong. If an endpoint starts returning `403 Missing required permissions`,
+  check the ability named in the message instead of widening the token.
+
 ## Coolify integration — the sharp edges
 
 Everything below was learned the hard way; re-verify only if the Coolify version
@@ -176,3 +205,8 @@ deploys. Do not add auth half-heartedly — the intended deployment is behind a
 private network, VPN or an authenticating proxy. The token is read from the
 environment only and is never sent to the browser; do not add an endpoint that
 returns it or logs it.
+
+The blast radius is the union of both credentials: the token can deploy anything
+in its team, and the socket is effectively full access to the Docker daemon of
+the host it runs on. That is why the app is expected to run on the same host as
+the workloads it watches, and not exposed to the internet.
