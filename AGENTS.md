@@ -99,6 +99,10 @@ problem, and dropping either one silently degrades the product.
 
 Consequences to keep in mind:
 
+- Containers are filtered by `IGNORE` (`UPDATES_IGNORE`, default `^coolify(-|$)`) before
+  any work happens: Coolify's own stack is not listed and not counted. The number of
+  hidden containers is reported (`STATE["ignored"]`) so the list does not silently
+  shrink.
 - **Without the socket** there is nothing to compare against. The honest output is
   "tag drift" (digest changed since the last observation), never `UPDATE`/`ok` based
   on the running container. Version columns must stay empty, not be guessed.

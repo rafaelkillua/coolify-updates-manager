@@ -115,6 +115,7 @@ Everything is optional; the defaults give you a read-only dashboard.
 | `UPDATES_PORT` | `8799` | — | listening port |
 | `UPDATES_BIND` | `0.0.0.0` | — | listening address |
 | `UPDATES_WORKERS` | `8` | — | parallel registry requests |
+| `UPDATES_IGNORE` | `^coolify(-|$)` | — | comma-separated regexes for containers to hide entirely. Default hides Coolify's own stack (`coolify`, `coolify-db`, `coolify-proxy`…) |
 | `UPDATES_TIMEOUT` | `60` | — | per-request timeout, seconds |
 | `UPDATES_TAGS_TTL` | `21600` | — | how long a registry tag list is cached, seconds |
 | `UPDATES_DIGEST_TTL` | `900` | — | how long a manifest digest is cached, seconds |

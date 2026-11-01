@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.9.0"
+VERSION = "2.9.1"
 APP_NAME = "coolify-updates-manager"
 
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -41,6 +41,10 @@ COOLIFY_TOKEN = os.environ.get("COOLIFY_TOKEN", "").strip()
 BIND = os.environ.get("UPDATES_BIND", "0.0.0.0")
 PORT = int(os.environ.get("UPDATES_PORT", "8799"))
 STATE_FILE = os.environ.get("UPDATES_STATE", "/data/state.json")
+# containers matching any of these patterns are not listed at all (comma separated
+# regular expressions). Default hides Coolify's own stack: coolify, coolify-db, ...
+IGNORE = [re.compile(p.strip()) for p in os.environ.get("UPDATES_IGNORE", r"^coolify(-|$)").split(",") if p.strip()]
+
 WORKERS = int(os.environ.get("UPDATES_WORKERS", "8"))
 CHECK_TIMEOUT = int(os.environ.get("UPDATES_TIMEOUT", "60"))
 TAGS_TTL = int(os.environ.get("UPDATES_TAGS_TTL", "21600"))      # registry tag list
@@ -557,6 +561,7 @@ STATE = {
     "duration": None,
     "rows": [],
     "counts": {"UPDATE": 0, "ok": 0, "??": 0},
+    "ignored": 0,
     "error": None,
     "pins": {},
     "level": "current",
@@ -652,8 +657,12 @@ def _image_facts(image_id):
 def collect():
     containers = docker_get("/containers/json?all=1")
     prepared, image_ids = [], {}
+    ignored = 0
     for container in containers:
         name = (container.get("Names") or ["/?"])[0].lstrip("/")
+        if any(pattern.search(name) for pattern in IGNORE):
+            ignored += 1
+            continue
         labels = container.get("Labels") or {}
         ref = container.get("Image") or ""
         try:
@@ -726,7 +735,7 @@ def collect():
     for row in rows:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
     rows.sort(key=lambda r: (0 if r["status"] == "UPDATE" else 1 if r["status"] == "??" else 2, r["container"]))
-    return rows, counts
+    return rows, counts, ignored
 
 
 def resolve_rows(level):
@@ -772,7 +781,8 @@ def run_check():
     def work():
         started = time.time()
         try:
-            rows, counts = collect()
+            rows, counts, ignored = collect()
+            STATE["ignored"] = ignored
             _finish_check(rows, counts, started)
             CHECKING.clear()     # the table is usable now
             # slow parts run in the background so the button never blocks on them
@@ -1136,6 +1146,7 @@ def config_view():
         "tags_ttl": TAGS_TTL,
         "digest_ttl": DIGEST_TTL,
         "preview_ttl": PREVIEW_TTL,
+        "ignore": [p.pattern for p in IGNORE],
         "versions_ttl": VERSIONS_TTL,
         "bind": f"{BIND}:{PORT}",
     }
@@ -1368,6 +1379,9 @@ PAGE = r"""<!doctype html>
           per Hub image; the footer shows the worker count and cache TTLs in use.</p>
         <p>Rows with <code>??</code> are images built locally or projects that publish a single channel with no
           versioned tags — there is nothing to compare against.</p>
+        <p>Coolify's own containers (<code>coolify</code>, <code>coolify-db</code>, <code>coolify-proxy</code>…)
+          are hidden by default. The footer shows the patterns in use (<code>UPDATES_IGNORE</code>, comma-separated
+          regular expressions) and how many containers were hidden.</p>
       </div>
     </div>
     <div class="foot">
@@ -1466,7 +1480,8 @@ function render() {
   }).join("") : `<tr><td colspan="7" class="dim">No rows match the current filter.</td></tr>`;
   const outdated = rows.filter(r => rowStatus(r) === "UPDATE").length;
   $("#targetHead").textContent = state.level === "current" ? "Target" : "Target (" + LEVEL_NAMES[state.level] + ")";
-  $("#meta").textContent = `${num.format(outdated)} of ${num.format(rows.length)} outdated · checked ${fmtTime(state.checked_at_epoch, state.checked_at)} (${state.duration ?? "?"}s)`;
+  const ignored = state.ignored ? ` · ${num.format(state.ignored)} hidden` : "";
+  $("#meta").textContent = `${num.format(outdated)} of ${num.format(rows.length)} outdated${ignored} · checked ${fmtTime(state.checked_at_epoch, state.checked_at)} (${state.duration ?? "?"}s)`;
   setDeployAllState();
 }
 function setDeployAllState() {
@@ -1497,6 +1512,7 @@ function renderConfig() {
     `&nbsp; state=<code>${esc(c.state_file)}</code> ` +
     `&nbsp; workers=${c.workers} timeout=${c.timeout}s ttl tags=${c.tags_ttl}s digest=${c.digest_ttl}s ` +
     `preview=${c.preview_ttl}s versions=${c.versions_ttl}s ` +
+    `&nbsp; ignore=<code>${esc((c.ignore || []).join(",") || "-")}</code> ` +
     `&nbsp; ${state.warming ? `warming versions ${(state.warm || {}).done || 0}/${(state.warm || {}).total || 0}` : "versions warm"} ` +
     `&nbsp; v${esc(state.version)}`;
 }
