@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.8.1"
+VERSION = "2.9.0"
 APP_NAME = "coolify-updates-manager"
 
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -87,28 +87,40 @@ class UnixHTTPConnection(http.client.HTTPConnection):
         self.sock = sock
 
 
-def docker_get(path):
-    conn = UnixHTTPConnection(DOCKER_SOCK)
+# A socket proxy (docker-socket-proxy, wollomatic/socket-proxy, ...) can stand in
+# for the daemon socket: point DOCKER_URL at it and the panel talks plain HTTP.
+DOCKER_URL = os.environ.get("DOCKER_URL", "").strip().rstrip("/")
+
+
+def docker_connection(timeout=CHECK_TIMEOUT):
+    if DOCKER_URL:
+        parsed = urllib.parse.urlparse(DOCKER_URL)
+        return http.client.HTTPConnection(parsed.hostname, parsed.port or 2375, timeout=timeout)
+    return UnixHTTPConnection(DOCKER_SOCK, timeout=timeout)
+
+
+def docker_request(method, path, timeout=CHECK_TIMEOUT):
+    """Return (status, body bytes) from the Docker API (socket or proxy URL)."""
+    conn = docker_connection(timeout)
     try:
-        conn.request("GET", path)
+        conn.request(method, path)
         resp = conn.getresponse()
-        body = resp.read()
-        if resp.status >= 400:
-            raise RuntimeError(f"docker {path} -> {resp.status}: {body[:200]!r}")
-        return json.loads(body)
+        return resp.status, resp.read()
     finally:
         conn.close()
+
+
+def docker_get(path):
+    status, body = docker_request("GET", path)
+    if status >= 400:
+        raise RuntimeError(f"docker {path} -> {status}: {body[:200]!r}")
+    return json.loads(body)
 
 
 def docker_post(path, timeout=900):
     """POST to the Docker API and return (status, body)."""
-    conn = UnixHTTPConnection(DOCKER_SOCK, timeout=timeout)
-    try:
-        conn.request("POST", path, headers={"Content-Length": "0"})
-        resp = conn.getresponse()
-        return resp.status, resp.read().decode("utf-8", "replace")
-    finally:
-        conn.close()
+    status, body = docker_request("POST", path, timeout=timeout)
+    return status, body.decode("utf-8", "replace")
 
 
 def docker_pull(ref):
@@ -128,6 +140,9 @@ def docker_pull(ref):
     except Exception as exc:  # noqa: BLE001
         return False, f"pull failed: {type(exc).__name__}: {exc}"
     if status >= 400:
+        if status in (401, 403):
+            return False, (f"pull denied by the docker endpoint (HTTP {status}). A socket proxy must allow "
+                           f"POST /images/create: {body[:160]}")
         return False, f"pull failed: HTTP {status}: {body[:200]}"
     errors = [line for line in body.splitlines() if "\"error\"" in line]
     if errors:
@@ -990,6 +1005,16 @@ def poll_deploy_jobs(force=False):
     return list(DEPLOY_JOBS.values())
 
 
+def active_deploys():
+    """uuid -> status for deploys that are still running (for the table)."""
+    with LOCK:
+        return {
+            uuid: {"status": job.get("status"), "at": job.get("started_at")}
+            for uuid, job in DEPLOY_JOBS.items()
+            if job.get("status") not in TERMINAL_JOB
+        }
+
+
 def deploy_jobs():
     jobs = sorted(poll_deploy_jobs(), key=lambda j: j.get("started", 0), reverse=True)
     ui = os.environ.get("COOLIFY_UI_URL", "").rstrip("/")
@@ -1101,7 +1126,8 @@ def preview(uuids, force=False):
 
 def config_view():
     return {
-        "docker_sock": DOCKER_SOCK,
+        "docker_sock": DOCKER_URL or DOCKER_SOCK,
+        "docker_via_proxy": bool(DOCKER_URL),
         "state_file": STATE_FILE,
         "coolify_api_url": COOLIFY_API_URL,
         "deploy_enabled": bool(COOLIFY_TOKEN),
@@ -1391,6 +1417,9 @@ function rowStatus(r) {
   if (state.level !== "current" && r.target) return r.target.status;
   return r.status;
 }
+function activeDeploy(r) {
+  return (state.deploys_active || {})[r.deploy_uuid] || null;
+}
 function resourceCell(r) {
   const name = r.resource || r.project || (r.url ? r.url.replace(/^https?:\/\//, "") : "");
   if (!name && !r.url) return '<span class="dim">—</span>';
@@ -1408,14 +1437,15 @@ function targetCell(r) {
 function render() {
   const q = $("#q").value.toLowerCase(), only = $("#onlyUpd").checked;
   const list = rows.filter(r => {
-    if (only && rowStatus(r) !== "UPDATE") return false;
+    // a row with a deploy running stays visible even when it is no longer outdated
+    if (only && rowStatus(r) !== "UPDATE" && !activeDeploy(r)) return false;
     if (!q) return true;
     return (r.container + " " + r.image + " " + (r.resource || "")).toLowerCase().includes(q);
   });
   $("#rows").innerHTML = list.length ? list.map(r => {
-    const can = canDeploy(r), id = esc(r.container), st = rowStatus(r);
+    const can = canDeploy(r), id = esc(r.container), st = rowStatus(r), busy = activeDeploy(r);
     const running = r.version || r.created || "";
-    return `<tr class="${st === "UPDATE" ? "upd" : ""}">
+    return `<tr class="${st === "UPDATE" || busy ? "upd" : ""}">
       <td>${can ? `<input type="checkbox" data-c="${id}" ${sel.has(r.container) ? "checked" : ""}
              aria-label="Select ${id}">` : ""}</td>
       <td>${resourceCell(r)}<span class="sub">${id}</span></td>
@@ -1423,10 +1453,12 @@ function render() {
       <td><span class="tag ${esc(r.policy)}">${esc(r.policy)}</span>
           <span class="sub">${esc(running) || "—"}</span></td>
       <td>${targetCell(r)}</td>
-      <td><span class="pill p-${esc(st)}">${esc(st)}</span></td>
+      <td>${busy
+        ? `<span class="pill upd" title="Deploy started at ${esc(busy.at || "")}">deploying…</span>`
+        : `<span class="pill p-${esc(st)}">${esc(st)}</span>`}</td>
       <td>${can
         ? `<button class="row-btn" type="button" data-deploy="${esc(r.deploy_uuid)}"
-             title="Deploy now: re-pull the compose tag and recreate the container (the compose file is not edited)">Update</button>
+             ${busy ? "disabled title=\"Deploy already running\"" : 'title="Deploy now: re-pull the compose tag and recreate the container (the compose file is not edited)"'}>Update</button>
            <button class="row-btn" type="button" data-pin="${id}"
              title="Which versioned tag the floating tag points to today">Exact Tag</button>`
         : `<span class="dim">${esc(r.note || "not deployable")}</span>`}</td>
@@ -1472,6 +1504,10 @@ async function fetchState() {
   try {
     state = await (await fetch("api/state")).json();
     rows = state.rows || [];
+    if (sel.size) {   // forget selections whose row is gone (deploy finished, row turned ok)
+      const known = new Set(rows.map(r => r.container));
+      for (const name of [...sel]) if (!known.has(name)) sel.delete(name);
+    }
     if ($("#level").value !== state.level) $("#level").value = state.level;
     if (state.deploy_hint) { $("#banner").textContent = state.deploy_hint; $("#banner").style.display = "block"; }
     render(); renderConfig(); syncUrl();
@@ -1539,6 +1575,9 @@ async function doDeploy(uuids, btn) {
                                          body: JSON.stringify({uuids})});
   const data = await res.json();
   const results = data.results || [];
+  // the selection is spent: those rows are being deployed now
+  sel.clear();
+  render();
   const failed = results.filter(x => !x.ok);
   const ok = results.length - failed.length;
   toast(failed.length
@@ -1729,6 +1768,7 @@ class Handler(BaseHTTPRequestHandler):
                 deploy_enabled=bool(COOLIFY_TOKEN),
                 deploy_hint=DEPLOY_HINT,
                 deploy_log=DEPLOY_LOG,
+                deploys_active=active_deploys(),
                 levels=list(LEVELS),
                 config=config_view(),
                 version=VERSION,

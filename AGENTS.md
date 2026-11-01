@@ -154,6 +154,15 @@ changes materially.
 - Write: `POST /images/create?fromImage=&tag=` (pull). Nothing else.
 - The socket is mounted `:ro`, **but that flag does not restrict API calls** —
   only the file. Treat the mount as full daemon access and say so in docs.
+- `DOCKER_URL` (http) takes precedence over `DOCKER_SOCK`, so the app can talk to a
+  socket proxy instead of the daemon. Keep both code paths working: the URL path is
+  the recommended deployment and the socket path is the zero-config one.
+- A proxy must allow **`POST /images/create`** (the pull) on top of the read
+  endpoints. With `tecnativa/docker-socket-proxy` that means `CONTAINERS=1 IMAGES=1
+  POST=1`, which also allows container start/stop/remove (availability) but still
+  blocks `/containers/create`, `/volumes`, and `/exec/{id}/start` — verified. If a
+  pull returns 401/403, `docker_pull` says so explicitly; do not "fix" it by
+  widening the proxy without understanding what `POST=1` reopens.
 - `/containers/json` may report the image **id** instead of the reference;
   prefer `.Config.Image` from the inspect and fall back to `RepoTags`.
 - Container → public address: parse `traefik.http.routers.*.rule` for

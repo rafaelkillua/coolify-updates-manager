@@ -110,6 +110,7 @@ Everything is optional; the defaults give you a read-only dashboard.
 | `COOLIFY_API_URL` | `http://host.docker.internal:8000` | deploy buttons | Coolify API base URL as seen **from inside the container** |
 | `COOLIFY_UI_URL` | — | links in the progress dialog | Coolify UI base (e.g. `https://coolify.example.com`) used to build "open in Coolify" links |
 | `DOCKER_SOCK` | `/var/run/docker.sock` | always | path to the Docker socket *inside the container* — the only source of the running image digest |
+| `DOCKER_URL` | — | — | talk to a Docker socket proxy (`http://proxy:2375`) instead of the socket; overrides `DOCKER_SOCK` |
 | `UPDATES_STATE` | `/data/state.json` | — | where the last result is cached (mount a volume) |
 | `UPDATES_PORT` | `8799` | — | listening port |
 | `UPDATES_BIND` | `0.0.0.0` | — | listening address |
@@ -204,6 +205,59 @@ About the Docker socket: it is mounted `:ro`, but that flag does **not** restric
 API calls — the panel needs `POST /images/create` to pull images. Treat the socket
 mount as full Docker API access: this container can, in principle, do anything the
 daemon allows.
+
+### Putting a socket proxy in front of the daemon
+
+A proxy narrows that to a per-endpoint allowlist. Point `DOCKER_URL` at it and drop
+the socket mount:
+
+```yaml
+services:
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    restart: unless-stopped
+    environment:
+      CONTAINERS: "1"      # list containers, read their config
+      IMAGES: "1"          # read image metadata, pull images
+      POST: "1"            # required for the pull (POST /images/create)
+      EXEC: "0"
+      VOLUMES: "0"
+      NETWORKS: "0"
+      BUILD: "0"
+      SYSTEM: "0"
+      AUTH: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  app:
+    image: coolify-updates-manager:latest
+    environment:
+      DOCKER_URL: http://docker-proxy:2375
+    # no /var/run/docker.sock mount
+```
+
+What that buys, measured against `tecnativa/docker-socket-proxy` with the config
+above (the pull forces `POST=1`):
+
+| request | raw socket | proxy |
+|---|---|---|
+| read containers / images | yes | yes |
+| pull an image | yes | yes |
+| start/stop/restart containers | yes | **yes** (availability only) |
+| `POST /containers/create` (privileged, host mounts) | yes | **blocked (404)** |
+| `GET /volumes` (read or mount volumes) | yes | **blocked (403)** |
+| `POST /exec/{id}/start` (shell inside a container) | yes | **blocked (403)** |
+| networks, build, swarm, secrets, plugins | yes | **blocked** |
+
+The remaining write power is image pulls and container lifecycle — a DoS surface,
+not host root. With `POST=0` the trade-off inverts: the proxy becomes read-only and
+the panel can no longer pull, so **service deploys would recreate containers from
+the cached image** (the panel reports `pull denied by the docker endpoint` and stops
+before deploying). Applications are unaffected because Coolify pulls for them.
+
+If you want the pull restricted to exactly one endpoint, use
+[`wollomatic/socket-proxy`](https://github.com/wollomatic/socket-proxy), which
+supports per-path regular expressions (`allowPOST = ["^/v[0-9.]+/images/create$"]`).
 
 ## Limitations
 
