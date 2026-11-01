@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 APP_NAME = "coolify-updates-manager"
 
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -291,6 +291,73 @@ def suggest_pin(ref):
         alternatives = [t for t in tags if t != hit and t.startswith(base)]
         result["matches"] = [hit] + alternatives[:3]
     return result
+
+
+_exact_cache = {}
+
+
+def exact_tag_for_digest(registry, repo, digest):
+    """Which versioned tag carries this digest (reverse lookup, cached)."""
+    if not digest:
+        return None
+    key = (registry, repo, digest)
+    with CACHE_LOCK:
+        hit = _exact_cache.get(key)
+        if hit and time.time() - hit[0] < TAGS_TTL:
+            return hit[1]
+    result = None
+    try:
+        tags = [t for t in registry_tags(registry, repo) if not PRERELEASE.search(t)]
+        release_like = re.compile(r"^[vV]?\d+(\.\d+){0,2}([-_][A-Za-z][A-Za-z0-9.]*)?$")
+        dateish = re.compile(r"\d{6,}")
+        pools = [
+            sorted([t for t in tags if release_like.match(t) and not dateish.search(t)],
+                   key=_version_key, reverse=True),
+            sorted([t for t in tags if re.fullmatch(r"v?\d+(\.\d+)*\.\d+-ls\d+", t)],
+                   key=_linuxserver_key, reverse=True),
+            sorted([t for t in tags if re.fullmatch(r"[vV]?\d+(\.\d+)*(-[A-Za-z0-9._]+)?", t)],
+                   key=_version_key, reverse=True),
+        ]
+        for pool in pools:
+            for candidate in pool[:8]:
+                if registry_digest(registry, repo, candidate) == digest:
+                    result = candidate
+                    break
+            if result:
+                break
+    except Exception:
+        result = None
+    with CACHE_LOCK:
+        _exact_cache[key] = (time.time(), result)
+    return result
+
+
+def version_running(row):
+    """Version the container is running today (label, tag text, or digest lookup)."""
+    label = parse_version(row.get("version"))
+    if label:
+        return label
+    tag_version = parse_version(row.get("tag") or "")
+    if tag_version and tag_version.count(".") >= 1:
+        return tag_version
+    registry, repo, _ = split_ref(row["image"])
+    for digest in (row.get("digests") or [])[:2]:
+        tag = exact_tag_for_digest(registry, repo, digest)
+        if tag:
+            return parse_version(tag) or tag_version
+    return tag_version or ""
+
+
+def version_after_pull(row):
+    """Version the current tag will give on the next deploy.
+
+    Deploying does not rewrite the compose tag, it re-pulls it, so this is the
+    release the tag points to right now (not the level target).
+    """
+    exact = newest_release(row)
+    if exact:
+        return parse_version(exact) or exact
+    return ""
 
 
 def newest_release(row):
@@ -598,6 +665,29 @@ def deployable(row):
     return bool(COOLIFY_TOKEN) and bool(re.fullmatch(r"[a-z0-9]{20,32}", project)) and project != "source"
 
 
+def preview(uuids):
+    """What each selected resource will become after a deploy."""
+    items = {}
+    for row in STATE["rows"]:
+        uuid = row.get("project") or ""
+        if uuid not in uuids:
+            continue
+        entry = items.setdefault(uuid, {
+            "uuid": uuid,
+            "resource": row.get("resource") or uuid,
+            "state": row.get("status"),
+            "containers": [],
+        })
+        entry["containers"].append({
+            "container": row["container"],
+            "image": row["image"],
+            "status": row.get("status"),
+            "running": version_running(row),
+            "next": version_after_pull(row),
+        })
+    return {"items": [items[k] for k in uuids if k in items]}
+
+
 def config_view():
     return {
         "docker_sock": DOCKER_SOCK,
@@ -656,6 +746,25 @@ PAGE = r"""<!doctype html>
   #toast{position:fixed;right:16px;bottom:16px;max-width:640px;background:var(--card);border:1px solid var(--line);
          border-radius:8px;padding:12px 14px;font-size:13px;display:none;white-space:pre-wrap;z-index:20}
   #toast.err{border-color:#f85149}
+  #modal{position:fixed;inset:0;background:#0d1117cc;display:none;align-items:center;justify-content:center;
+         z-index:30;padding:20px}
+  #modal.open{display:flex}
+  #modal .box{background:var(--card);border:1px solid var(--line);border-radius:10px;max-width:920px;width:100%;
+         max-height:85vh;display:flex;flex-direction:column}
+  #modal h2{margin:0;padding:14px 18px;font-size:14px;border-bottom:1px solid var(--line);font-weight:600}
+  #modal .scroll{overflow:auto}
+  #modal table{width:100%}
+  #modal td{padding:8px 18px}
+  #modal .foot{display:flex;gap:10px;justify-content:flex-end;align-items:center;padding:14px 18px;
+         border-top:1px solid var(--line)}
+  #modal .foot .hint{margin-right:auto;color:var(--dim);font-size:12px}
+  .arrow{color:var(--dim);padding:0 6px}
+  .warn{color:var(--upd)}
+  details.help{margin:0 20px 14px;color:var(--dim);font-size:13px}
+  details.help summary{cursor:pointer;color:var(--fg)}
+  details.help ul{margin:8px 0 0 18px;padding:0}
+  details.help li{margin:4px 0}
+  details.help code{color:#a5d6ff}
   input[type=search]{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:6px;
          padding:6px 10px;font:inherit;min-width:200px}
   label.chk{display:flex;gap:6px;align-items:center;color:var(--dim);cursor:pointer}
@@ -678,6 +787,18 @@ PAGE = r"""<!doctype html>
   <label class="chk"><input type="checkbox" id="onlyUpd" checked> outdated only</label>
 </header>
 <div id="banner"></div>
+<details class="help"><summary>what does each action do?</summary><ul>
+  <li><b>Check now</b> — re-reads the Docker daemon and asks each registry for the current digest of the tag.
+      Pulls nothing, changes nothing.</li>
+  <li><b>update</b> (row) — deploys that Coolify resource immediately
+      (<code>POST /api/v1/deploy?uuid=…</code>): Coolify re-pulls the tag written in your compose and
+      recreates the container. Your compose is not edited.</li>
+  <li><b>exact tag</b> (row) — which versioned tag the floating tag points to today, for you to copy into
+      the compose.</li>
+  <li><b>compare against</b> — what the <i>target</i> column resolves to (current tag / newest major line /
+      newest minor line); this is what decides <code>UPDATE</code> vs <code>ok</code>.</li>
+  <li><b>Update selected</b> — the same deploy for several resources, after showing what each one will become.</li>
+</ul></details>
 <main><table>
   <thead><tr>
     <th style="width:28px"><input type="checkbox" id="all"></th>
@@ -686,6 +807,16 @@ PAGE = r"""<!doctype html>
   <tbody id="rows"><tr><td colspan="7" class="dim">loading...</td></tr></tbody>
 </table></main>
 <footer id="config"></footer>
+<div id="modal"><div class="box">
+  <h2 id="mTitle">Deploy?</h2>
+  <div class="scroll"><table><thead><tr><th>resource</th><th>image</th><th>running → after deploy</th></tr></thead>
+    <tbody id="mRows"></tbody></table></div>
+  <div class="foot">
+    <span class="hint" id="mHint"></span>
+    <button id="mCancel">Cancel</button>
+    <button class="primary" id="mGo">Deploy</button>
+  </div>
+</div></div>
 <div id="toast"></div>
 <script>
 let rows = [], state = {}, sel = new Set();
@@ -731,8 +862,10 @@ function render() {
       <td>${targetCell(r)}</td>
       <td><span class="pill p-${esc(st)}">${esc(st)}</span></td>
       <td>${can
-        ? `<button class="row-btn" data-deploy="${esc(r.project)}">update</button>
-           <button class="row-btn" data-pin="${id}">exact tag</button>`
+        ? `<button class="row-btn" data-deploy="${esc(r.project)}"
+             title="Deploy now: re-pull the compose tag and recreate the container (compose is not edited)">update</button>
+           <button class="row-btn" data-pin="${id}"
+             title="Which versioned tag the floating tag points to today">exact tag</button>`
         : `<span class="dim">${esc(r.note || "not deployable")}</span>`}</td>
     </tr>`;
   }).join("") : `<tr><td colspan="7" class="dim">nothing here.</td></tr>`;
@@ -809,9 +942,45 @@ document.addEventListener("click", async e => {
                     : `${name}\n${pin.image}\n\nexact tag for the current digest: ${pin.matches.length ? pin.matches.join("  |  ") : "none (project publishes channels only)"}\n(digest ${pin.digest})`);
   } finally { pinBtn.disabled = false; pinBtn.textContent = "exact tag"; }
 });
-$("#deployAll").onclick = () => {
+function closeModal() { $("#modal").classList.remove("open"); }
+function openModal(items) {
+  $("#mRows").innerHTML = items.map(it => it.containers.map(c => {
+    const from = c.running || "unknown";
+    const to = c.next || "unknown";
+    const same = from && to && from === to;
+    return `<tr>
+      <td><code>${esc(it.resource)}</code><span class="sub">${esc(c.container)}</span></td>
+      <td><code>${esc(c.image)}</code></td>
+      <td>${esc(from)}<span class="arrow">→</span><b>${esc(to)}</b>
+          ${same ? '<span class="warn"> (same version, container only recreated)</span>' : ''}</td>
+    </tr>`;
+  }).join("")).join("");
+  const n = items.length;
+  $("#mTitle").textContent = `Deploy ${n} resource${n > 1 ? "s" : ""}?`;
+  $("#mGo").textContent = `Deploy ${n}`;
+  $("#mHint").textContent = "Coolify re-pulls the compose tag; the compose file is not changed.";
+  $("#modal").dataset.uuids = JSON.stringify(items.map(i => i.uuid));
+  $("#modal").classList.add("open");
+}
+$("#mCancel").onclick = closeModal;
+$("#modal").onclick = e => { if (e.target.id === "modal") closeModal(); };
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
+$("#mGo").onclick = () => {
+  const uuids = JSON.parse($("#modal").dataset.uuids || "[]");
+  closeModal();
+  doDeploy(uuids);
+};
+$("#deployAll").onclick = async () => {
   const uuids = [...new Set(rows.filter(r => sel.has(r.container) && canDeploy(r)).map(r => r.project))];
-  if (uuids.length && confirm("Deploy " + uuids.length + " resource(s) in Coolify?\n\n" + uuids.join("\n"))) doDeploy(uuids);
+  if (!uuids.length) return;
+  toast("resolving what will change...");
+  try {
+    const res = await fetch("api/preview", {method: "POST", headers: {"Content-Type": "application/json"},
+                                            body: JSON.stringify({uuids})});
+    const data = await res.json();
+    if (!data.items || !data.items.length) return toast("nothing to deploy", true);
+    openModal(data.items);
+  } catch (e) { toast("preview failed: " + e, true); }
 };
 fetchState();
 </script></body></html>
@@ -879,13 +1048,18 @@ class Handler(BaseHTTPRequestHandler):
             changed = set_level(level)
             return self._send(200, json.dumps({"level": STATE["level"], "changed": changed}))
 
-        if path == "/api/deploy":
-            if not COOLIFY_TOKEN:
-                return self._fail(503, DEPLOY_HINT)
+        if path in ("/api/deploy", "/api/preview"):
             uuids = body.get("uuids") or ([body["uuid"]] if body.get("uuid") else [])
             uuids = [u for u in uuids if isinstance(u, str) and re.fullmatch(r"[a-z0-9]{20,32}", u)]
             if not uuids:
                 return self._fail(400, "provide a valid uuid list")
+            if path == "/api/preview":
+                try:
+                    return self._send(200, json.dumps(preview(uuids)))
+                except Exception as exc:  # noqa: BLE001
+                    return self._fail(502, f"{type(exc).__name__}: {exc}")
+            if not COOLIFY_TOKEN:
+                return self._fail(503, DEPLOY_HINT)
             return self._send(200, json.dumps({"results": deploy(uuids)}))
 
         if path == "/api/pin":

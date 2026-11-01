@@ -33,6 +33,18 @@ newest release is `v3.5.1`, and the row shows `UPDATE` if your container is stil
 on `v3.4.1`. If the project publishes only full versions, the target falls back
 to the exact tag and says so.
 
+## Actions
+
+| action | what it does |
+|---|---|
+| **Check now** | Re-reads the Docker daemon and asks each registry for the current digest of the tag. Pulls nothing, changes nothing. |
+| **update** (one row) | Deploys that resource immediately — `POST /api/v1/deploy?uuid=…`. Coolify re-pulls the tag written in your compose and recreates the container. The compose file is not edited. |
+| **exact tag** (one row) | Shows which versioned tag the floating tag points to today, so you can copy it into the compose. Read-only. |
+| **compare against** | Switches what the *target* column resolves to (`current tag` / newest `major` line / newest `minor` line). This is what decides `UPDATE` vs `ok`. |
+| **Update selected** | Same deploy, for the resources you checked. Opens a dialog listing every container with the running version and the version it will be on after the pull, and waits for confirmation. |
+
+The deploy never rewrites your compose. If you want the tag pinned, take the value from the *target* column (or from `exact tag`) and edit the compose yourself.
+
 ## Environment variables
 
 Everything is optional; the defaults give you a read-only dashboard.
@@ -101,6 +113,7 @@ Open `http://localhost:8799`.
 | GET | `/api/state` | last result, selected level, config, deploy capability |
 | POST | `/api/check` | start a full check (202, or 409 when one is running) |
 | POST | `/api/level` | `{"level": "current"\|"major"\|"minor"}` — switch the target |
+| POST | `/api/preview` | `{"uuids": ["…"]}` — running version → version after the pull, per container |
 | POST | `/api/deploy` | `{"uuids": ["<coolify uuid>"]}` — deploy in Coolify |
 | POST | `/api/pin` | `{"container": "<name>"}` — versioned tag matching the current digest |
 
