@@ -1,8 +1,8 @@
 services:
-  updates-web:
+  app:
     build:
       context: .
-    image: updates-web:latest
+    image: coolify-updates-manager:latest
     restart: unless-stopped
     init: true
     read_only: true

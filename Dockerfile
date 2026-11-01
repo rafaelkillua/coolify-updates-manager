@@ -1,8 +1,8 @@
 FROM python:3.12-alpine
 
-LABEL org.opencontainers.image.title="updates-web" \
+LABEL org.opencontainers.image.title="coolify-updates-manager" \
       org.opencontainers.image.description="Docker image update dashboard with one-click deploy on Coolify" \
-      org.opencontainers.image.source="https://github.com/rafaelkillua/updates-web" \
+      org.opencontainers.image.source="https://github.com/rafaelkillua/coolify-updates-manager" \
       org.opencontainers.image.licenses="MIT"
 
 ENV PYTHONUNBUFFERED=1 \
