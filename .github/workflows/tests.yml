@@ -1,0 +1,50 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unittest (python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run the test suite
+        run: python3 -m unittest -v test_app
+
+  image:
+    # the tests pass on CPython; this proves they also pass on the image that
+    # actually ships (python:3.12-alpine) and that the container still boots
+    name: runtime image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t coolify-updates-manager:ci .
+      - name: Run the test suite inside the image
+        run: docker run --rm -v "$PWD:/src:ro" -w /src coolify-updates-manager:ci python -m unittest -v test_app
+      - name: The image boots and answers /healthz
+        run: |
+          docker run -d --name smoke -p 127.0.0.1:8799:8799 coolify-updates-manager:ci
+          for _ in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8799/healthz -o healthz.json; then break; fi
+            sleep 1
+          done
+          cat healthz.json
+          grep -q '"ok": true' healthz.json
+          docker logs smoke
+          docker rm -f smoke

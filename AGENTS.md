@@ -199,6 +199,29 @@ changes materially.
 
 ## Testing without production access
 
+`test_app.py` holds the unit and integration tests (stdlib `unittest`, no
+network, no credentials):
+
+```bash
+python3 -m unittest -v test_app       # 70 tests, ~5 s
+```
+
+How the isolation works, so new tests follow the same shape:
+
+- the Docker API is a stub `http.server` (`FakeDocker`); `app.DOCKER_URL` points
+  at it, which exercises the same code path as a socket proxy;
+- the registry is `FakeRegistry`, installed over `app.registry_digest` and
+  `app.registry_tags` (dicts of tag -> digest and repo -> tag list);
+- `reset_app()` clears `STATE`, the caches and the event flags between tests, so
+  order never matters;
+- the HTTP layer is exercised for real, with `app.Handler` on port 0.
+
+Every behaviour you change deserves a test there — the digest comparison, the
+`collect()` row shape, the level targets and the `503`/`400`/`409` branches are
+all cheap to assert.
+
+Against a real host (read-only mode, never on a port that serves traffic):
+
 ```bash
 docker compose up -d --build          # read-only mode, no token needed
 curl -s localhost:8799/healthz
