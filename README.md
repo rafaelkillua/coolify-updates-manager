@@ -1,5 +1,7 @@
 # coolify-updates-manager
 
+[![tests](https://github.com/rafaelkillua/coolify-updates-manager/actions/workflows/tests.yml/badge.svg)](https://github.com/rafaelkillua/coolify-updates-manager/actions/workflows/tests.yml)
+
 Dashboard that answers two questions about your Docker hosts:
 
 1. **Is the image I am running still what its tag points to?** It compares the
@@ -278,6 +280,15 @@ supports per-path regular expressions (`allowPOST = ["^/v[0-9.]+/images/create$"
 the Coolify/Docker behaviours that are easy to break. Read it before changing
 `app.py` — it explains why things are the way they are, including the parts that
 look odd (like pulling images from the panel before deploying).
+
+Tests need nothing but Python 3.12 and no credentials:
+
+```bash
+python3 -m unittest -v test_app      # 70 tests, ~5 s
+```
+
+CI (`.github/workflows/tests.yml`) runs them on every pull request: once on
+CPython 3.12 and once inside the built image, plus a `/healthz` boot check.
 
 ## License
 
