@@ -787,6 +787,9 @@ PAGE = r"""<!doctype html>
   footer{padding:14px 20px 30px;color:var(--dim);font-size:12px;border-top:1px solid var(--line)}
   footer b{color:var(--fg);font-weight:500}
   @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+  /* the header wraps on narrow screens: stop pinning both bars so the sticky
+     column headers cannot overlap the focused row */
+  @media (max-width:900px){header{position:static}th{position:static}}
 </style></head><body>
 <a class="skip" href="#main">Skip to content</a>
 <header>
