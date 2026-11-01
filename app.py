@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 APP_NAME = "coolify-updates-manager"
 
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -98,6 +98,41 @@ def docker_get(path):
         return json.loads(body)
     finally:
         conn.close()
+
+
+def docker_post(path, timeout=900):
+    """POST to the Docker API and return (status, body)."""
+    conn = UnixHTTPConnection(DOCKER_SOCK, timeout=timeout)
+    try:
+        conn.request("POST", path, headers={"Content-Length": "0"})
+        resp = conn.getresponse()
+        return resp.status, resp.read().decode("utf-8", "replace")
+    finally:
+        conn.close()
+
+
+def docker_pull(ref):
+    """Pull one image through the Docker API. Returns (ok, message).
+
+    Coolify's "deploy" for services recreates containers without pulling
+    (StartService defaults pullLatestImages to false on the API path), so the
+    panel pulls first and then asks Coolify to recreate.
+    """
+    if not ref or "@" in ref:
+        return True, "digest pinned, skipped"
+    registry, repo, tag = split_ref(ref)
+    name = repo if registry == "registry-1.docker.io" else f"{registry}/{repo}"
+    query = urllib.parse.urlencode({"fromImage": name, "tag": tag})
+    try:
+        status, body = docker_post(f"/images/create?{query}")
+    except Exception as exc:  # noqa: BLE001
+        return False, f"pull failed: {type(exc).__name__}: {exc}"
+    if status >= 400:
+        return False, f"pull failed: HTTP {status}: {body[:200]}"
+    errors = [line for line in body.splitlines() if "\"error\"" in line]
+    if errors:
+        return False, f"pull failed: {errors[0][:200]}"
+    return True, "pulled"
 
 
 def is_image_id(ref):
@@ -738,11 +773,13 @@ def _job_start(uuid, known):
         "uuid": uuid,
         "resource": (rows[0].get("resource") if rows else "") or uuid,
         "containers": [r["container"] for r in rows],
+        "images": sorted({r["image"] for r in rows if r.get("image") and r.get("status") != "??"}),
         "kind": known.get(uuid) or "?",
         "started": time.time(),
         "started_at": time.strftime("%H:%M:%S"),
-        "status": "submitting",
+        "status": "pulling",
         "message": "",
+        "pulled": [],
         "deployment_uuid": None,
         "deployment_url": None,
         "polled": 0,
@@ -750,57 +787,67 @@ def _job_start(uuid, known):
 
 
 def deploy(uuids):
-    """Trigger deploys and register a job per resource so progress can be followed."""
-    results = []
+    """Register one job per resource and run it in the background."""
     known = coolify_resources()
+    results = []
     for uuid in uuids:
         job = _job_start(uuid, known)
-        entry = {"uuid": uuid, "resource": job["resource"], "ok": False, "status": 0, "message": ""}
+        entry = {"uuid": uuid, "resource": job["resource"], "ok": True, "status": 202, "message": "queued"}
         if not COOLIFY_TOKEN:
-            entry["message"] = DEPLOY_HINT
             job.update(status="error", message=DEPLOY_HINT)
-            DEPLOY_JOBS[uuid] = job
-            results.append(entry)
-            continue
-        if known and uuid not in known:
-            entry["message"] = "uuid is not a resource in this Coolify instance"
-            job.update(status="error", message=entry["message"])
-            DEPLOY_JOBS[uuid] = job
-            results.append(entry)
-            continue
-        url = f"{COOLIFY_API_URL}/api/v1/deploy?uuid={urllib.parse.quote(uuid)}&force=false"
-        request = urllib.request.Request(url, method="POST", headers={
-            "Authorization": f"Bearer {COOLIFY_TOKEN}",
-            "Accept": "application/json",
-        })
-        try:
-            with urllib.request.urlopen(request, timeout=90) as resp:
-                body = resp.read().decode("utf-8", "replace")
-                entry.update(ok=True, status=resp.status, message=body[:400])
-                try:
-                    payload = json.loads(body)
-                    first = (payload.get("deployments") or [{}])[0]
-                except Exception:
-                    first = {}
-                job["deployment_uuid"] = first.get("deployment_uuid")
-                job["deployment_url"] = first.get("deployment_url")
-                job["message"] = (first.get("message") or body)[:300]
-                job["status"] = "queued" if job["deployment_uuid"] else "in progress"
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", "replace")
-            entry.update(status=exc.code, message=body[:400])
-            job.update(status="error", message=f"HTTP {exc.code}: {body[:300]}")
-        except Exception as exc:  # noqa: BLE001
-            entry["message"] = f"{type(exc).__name__}: {exc}"
-            job.update(status="error", message=entry["message"][:300])
+            entry.update(ok=False, status=0, message=DEPLOY_HINT)
+        elif known and uuid not in known:
+            message = "uuid is not a resource in this Coolify instance"
+            job.update(status="error", message=message)
+            entry.update(ok=False, status=0, message=message)
         with LOCK:
             DEPLOY_JOBS[uuid] = job
             DEPLOY_LOG[uuid] = {"at": job["started_at"], "ok": entry["ok"], "message": entry["message"][:200]}
-            # a deploy may change what the tags resolve to
-            _preview_cache.clear()
-            _versions_cache.clear()
+        if entry["ok"]:
+            threading.Thread(target=_run_deploy_job, args=(job,), daemon=True).start()
         results.append(entry)
     return results
+
+
+def _run_deploy_job(job):
+    """Pull the images, then ask Coolify to redeploy the resource."""
+    uuid = job["uuid"]
+    # Coolify's service deploy recreates containers without pulling, so pull here
+    if job.get("kind") != "application":
+        job["message"] = f"pulling {len(job.get('images') or [])} image(s)"
+        for ref in job.get("images") or []:
+            ok, message = docker_pull(ref)
+            with LOCK:
+                job["pulled"].append({"image": ref, "ok": ok, "message": message})
+            if not ok:
+                job.update(status="error", message=message)
+                return
+    job["status"] = "submitting"
+    request = urllib.request.Request(
+        f"{COOLIFY_API_URL}/api/v1/deploy?uuid={urllib.parse.quote(uuid)}&force=false",
+        method="POST",
+        headers={"Authorization": f"Bearer {COOLIFY_TOKEN}", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=90) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            try:
+                first = (json.loads(body).get("deployments") or [{}])[0]
+            except Exception:
+                first = {}
+            job["deployment_uuid"] = first.get("deployment_uuid")
+            job["deployment_url"] = first.get("deployment_url")
+            job["message"] = (first.get("message") or body)[:300]
+            job["status"] = "queued" if job["deployment_uuid"] else "in progress"
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        job.update(status="error", message=f"HTTP {exc.code}: {body[:300]}")
+    except Exception as exc:  # noqa: BLE001
+        job.update(status="error", message=f"{type(exc).__name__}: {exc}")
+    with LOCK:
+        # a deploy may change what the tags resolve to
+        _preview_cache.clear()
+        _versions_cache.clear()
 
 
 def _container_created_after(resource, since, old_names):
@@ -825,6 +872,8 @@ def poll_deploy_jobs(force=False):
     now = time.time()
     for job in list(DEPLOY_JOBS.values()):
         if job.get("status") in TERMINAL_JOB:
+            continue
+        if job.get("status") in ("pulling", "submitting"):
             continue
         if not force and now - job.get("polled", 0) < 3:
             continue
@@ -852,6 +901,10 @@ def poll_deploy_jobs(force=False):
             elif now - job["started"] > 900:
                 job["status"] = "timeout"
                 job["message"] = "no new container after 15 min, check Coolify"
+        # once a deploy ends, re-read the containers so the table shows the new version
+        if job.get("status") in TERMINAL_JOB and not job.get("refresh_queued"):
+            job["refresh_queued"] = True
+            run_check()
     return list(DEPLOY_JOBS.values())
 
 

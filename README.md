@@ -9,8 +9,16 @@ Dashboard that answers two questions about your Docker hosts:
    line and `minor` line, and the listing tells you the exact tag to use and
    whether your container is already on it.
 
-When a Coolify API token is configured, each row also gets an **update** button
-that triggers a deploy of that resource.
+When a Coolify API token is configured, each row also gets an **update** button:
+the panel pulls the image through the Docker API (the tag may have moved) and then
+calls `POST /api/v1/deploy?uuid=<uuid>&force=false`.
+
+> Why pull first: for **services**, Coolify 4.5.x calls `StartService::run($service)`
+> with `pullLatestImages = false` on the API path (only the UI button passes `true`),
+> so a deploy from the API recreates the containers with the cached image and the
+> version does not change. Applications are fine — their deployment job runs
+> `docker compose pull`. The panel pulls for non-application resources and skips it
+> for images pinned by digest or built locally.
 
 Single-file Python app (standard library only), one Dockerfile, one compose file.
 
@@ -144,9 +152,15 @@ repository (`/docker-compose.yml`). Notes learned the hard way:
 
 There is no built-in authentication: anyone who can reach the port can trigger
 deploys. Run it on a private network, a VPN, or behind an authenticating proxy.
+
 The container is hardened (read-only root filesystem, all capabilities dropped,
-`no-new-privileges`, Docker socket mounted read-only) and the token is only read
-from the environment — it is never sent to the browser.
+`no-new-privileges`) and the token is only read from the environment — it is never
+sent to the browser.
+
+About the Docker socket: it is mounted `:ro`, but that flag does **not** restrict
+API calls — the panel needs `POST /images/create` to pull images. Treat the socket
+mount as full Docker API access: this container can, in principle, do anything the
+daemon allows.
 
 ## Limitations
 
