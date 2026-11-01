@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 APP_NAME = "coolify-updates-manager"
 
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -745,8 +745,9 @@ PAGE = r"""<!doctype html>
           color:var(--upd);border-radius:6px;font-size:13px}
   table{border-collapse:collapse;width:100%}
   th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
-  th{color:var(--dim);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.04em;
-     position:sticky;top:57px;background:var(--bg)}
+  th{color:var(--dim);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+  /* the sticky offset belongs to the page header, so it only applies to the main list */
+  main th{position:sticky;top:57px;background:var(--bg);z-index:1}
   tr.upd td{background:#d299220d}
   code{color:#a5d6ff;overflow-wrap:anywhere}
   .sub{display:block;color:var(--dim);font-size:12px;overflow-wrap:anywhere}
@@ -754,7 +755,12 @@ PAGE = r"""<!doctype html>
   .p-UPDATE{color:var(--upd);border-color:#d2992255;background:#d299221a}
   .p-ok{color:var(--ok);border-color:#3fb95055;background:#3fb9501a}
   .p-\?\?{color:var(--dim);border-color:var(--line);background:var(--card)}
-  .row-btn{padding:3px 10px;font-size:12px}
+  .row-btn{padding:3px 10px;font-size:12px;min-width:96px}
+  #deployAll{min-width:196px}
+  .spin{display:inline-block;width:11px;height:11px;margin-right:7px;vertical-align:-1px;
+        border:2px solid currentColor;border-right-color:transparent;border-radius:50%;
+        animation:spin .7s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
   #toast{position:fixed;right:16px;bottom:16px;max-width:640px;background:var(--card);border:1px solid var(--line);
          border-radius:8px;padding:12px 14px;font-size:13px;display:none;white-space:pre-wrap;z-index:40;
          overflow-wrap:anywhere}
@@ -770,6 +776,7 @@ PAGE = r"""<!doctype html>
   dialog .scroll>div{padding-bottom:8px}
   dialog table{width:100%}
   dialog td{padding:8px 18px}
+  dialog th{position:sticky;top:0;background:var(--card);z-index:1;padding:8px 18px;border-bottom:1px solid var(--line)}
   dialog .foot{display:flex;gap:10px;justify-content:flex-end;align-items:center;padding:14px 18px;
          border-top:1px solid var(--line)}
   dialog .foot .hint{margin-right:auto;color:var(--dim);font-size:12px}
@@ -786,10 +793,10 @@ PAGE = r"""<!doctype html>
   label.chk{display:flex;gap:6px;align-items:center;color:var(--dim);cursor:pointer}
   footer{padding:14px 20px 30px;color:var(--dim);font-size:12px;border-top:1px solid var(--line)}
   footer b{color:var(--fg);font-weight:500}
-  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}.spin{display:none}}
   /* the header wraps on narrow screens: stop pinning both bars so the sticky
      column headers cannot overlap the focused row */
-  @media (max-width:900px){header{position:static}th{position:static}}
+  @media (max-width:900px){header{position:static}main th{position:static}}
 </style></head><body>
 <a class="skip" href="#main">Skip to content</a>
 <header>
@@ -904,7 +911,7 @@ PAGE = r"""<!doctype html>
 
 <div id="toast" role="status" aria-live="polite"></div>
 <script>
-let rows = [], state = {}, sel = new Set(), lastFocus = null;
+let rows = [], state = {}, sel = new Set(), lastFocus = null, previewBusy = false;
 const $ = s => document.querySelector(s);
 const esc = s => (s ?? "").toString().replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const LEVEL_NAMES = {current: "current tag", major: "major line", minor: "minor line"};
@@ -979,8 +986,26 @@ function render() {
   const outdated = rows.filter(r => rowStatus(r) === "UPDATE").length;
   $("#targetHead").textContent = state.level === "current" ? "Target" : "Target (" + LEVEL_NAMES[state.level] + ")";
   $("#meta").textContent = `${num.format(outdated)} of ${num.format(rows.length)} outdated · checked ${fmtTime(state.checked_at_epoch, state.checked_at)} (${state.duration ?? "?"}s)`;
-  $("#deployAll").disabled = sel.size === 0 || !state.deploy_enabled;
-  $("#deployAll").textContent = sel.size ? `Update Selected (${sel.size})` : "Update Selected";
+  setDeployAllState();
+}
+function setDeployAllState() {
+  const btn = $("#deployAll");
+  if (previewBusy) {
+    // only rewrite once: re-rendering on every state poll restarts the spinner
+    if (btn.dataset.busy !== "1") {
+      btn.dataset.busy = "1";
+      btn.disabled = true;
+      btn.setAttribute("aria-busy", "true");
+      btn.innerHTML = `<span class="spin" aria-hidden="true"></span>Resolving…`;
+    }
+    return;
+  }
+  if (btn.dataset.busy === "1") {
+    delete btn.dataset.busy;
+    btn.removeAttribute("aria-busy");
+  }
+  btn.disabled = sel.size === 0 || !state.deploy_enabled;
+  btn.textContent = sel.size ? `Update Selected (${sel.size})` : "Update Selected";
 }
 function renderConfig() {
   const c = state.config || {};
@@ -1005,8 +1030,13 @@ async function fetchState() {
   else { $("#check").disabled = false; $("#check").textContent = "Check Now"; }
   if (busy) setTimeout(fetchState, 2500);
 }
-async function doDeploy(uuids) {
+async function doDeploy(uuids, btn) {
   toast("Deploying " + uuids.length + " resource(s)…");
+  if (btn) {
+    btn.disabled = true;
+    btn.setAttribute("aria-busy", "true");
+    btn.innerHTML = `<span class="spin" aria-hidden="true"></span>`;
+  }
   const res = await fetch("api/deploy", {method: "POST", headers: {"Content-Type": "application/json"},
                                          body: JSON.stringify({uuids})});
   const data = await res.json();
@@ -1019,6 +1049,11 @@ async function doDeploy(uuids) {
       "\n\nCheck /api/state for the deployment log, or open the resource in Coolify."
     : `Deploy triggered for ${ok} resource(s). Coolify is pulling now; run Check Now in a minute to confirm.`,
     failed.length > 0);
+  if (btn) {
+    btn.removeAttribute("aria-busy");
+    btn.disabled = false;
+    btn.textContent = "Update";
+  }
 }
 $("#check").onclick = async () => { $("#check").disabled = true; await fetch("api/check", {method: "POST"}); setTimeout(fetchState, 1200); };
 $("#level").onchange = async e => {
@@ -1037,12 +1072,11 @@ document.addEventListener("change", e => {
   const name = e.target.dataset && e.target.dataset.c;
   if (!name) return;
   e.target.checked ? sel.add(name) : sel.delete(name);
-  $("#deployAll").disabled = sel.size === 0 || !state.deploy_enabled;
-  $("#deployAll").textContent = sel.size ? `Update Selected (${sel.size})` : "Update Selected";
+  setDeployAllState();
 });
 document.addEventListener("click", async e => {
   const deployBtn = e.target.closest("[data-deploy]");
-  if (deployBtn) return doDeploy([deployBtn.dataset.deploy]);
+  if (deployBtn) return doDeploy([deployBtn.dataset.deploy], deployBtn);
   const pinBtn = e.target.closest("[data-pin]");
   if (!pinBtn) return;
   const name = pinBtn.dataset.pin;
@@ -1090,16 +1124,26 @@ $("#mGo").onclick = () => {
   doDeploy(uuids);
 };
 $("#deployAll").onclick = async () => {
+  if (previewBusy) return;
   const uuids = [...new Set(rows.filter(r => sel.has(r.container) && canDeploy(r)).map(r => r.project))];
   if (!uuids.length) return;
-  toast("Resolving what will change…");
+  previewBusy = true;
+  setDeployAllState();
   try {
     const res = await fetch("api/preview", {method: "POST", headers: {"Content-Type": "application/json"},
                                             body: JSON.stringify({uuids})});
     const data = await res.json();
-    if (!data.items || !data.items.length) return toast("Nothing to deploy from the current selection.", true);
-    openDeployDialog(data.items);
-  } catch (e) { toast("Could not build the preview: " + e, true); }
+    if (!data.items || !data.items.length) {
+      toast("Nothing to deploy from the current selection.", true);
+    } else {
+      openDeployDialog(data.items);
+    }
+  } catch (e) {
+    toast("Could not build the preview: " + e, true);
+  } finally {
+    previewBusy = false;
+    setDeployAllState();
+  }
 };
 
 // state in the URL: ?level=minor&q=seerr&outdated=0
