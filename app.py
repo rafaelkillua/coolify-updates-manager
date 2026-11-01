@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 APP_NAME = "coolify-updates-manager"
 
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -578,6 +578,7 @@ def collect():
         image_ids.setdefault(ref, image_id)
 
     facts = {ref: _image_facts(image_id) for ref, image_id in image_ids.items()}
+    known = coolify_resources()
 
     def check(item):
         registry, repo, tag = split_ref(item["ref"])
@@ -589,12 +590,15 @@ def collect():
             status = "ok"
         else:
             status = "UPDATE"
+        deploy_uuid = resolve_deploy_uuid(item["container"], item["project"], known)
         if item["project"] == "source":
             note = "coolify internal stack"
         elif not item["project"]:
             note = "no coolify label"
         elif status == "??":
             note = "local build / no registry"
+        elif not deploy_uuid:
+            note = "uuid not found in coolify"
         else:
             note = ""
         policy, tag_version = classify_tag(tag)
@@ -611,6 +615,7 @@ def collect():
             "remote_digest": remote or "",
             "digests": local,
             "project": item["project"],
+            "deploy_uuid": deploy_uuid,
             "resource": item["resource"],
             "type": item["type"],
             "note": note,
@@ -702,12 +707,51 @@ def set_level(level):
 
 
 # ------------------------------------------------------------------ deploy --
+DEPLOY_JOBS = {}
+TERMINAL_JOB = {"finished", "failed", "cancelled", "error", "timeout"}
+COOLIFY_STATUS = {
+    "queued": "queued",
+    "in_progress": "in progress",
+    "finished": "finished",
+    "failed": "failed",
+    "cancelled": "cancelled",
+}
+
+
+def _job_start(uuid, known):
+    rows = [r for r in STATE["rows"] if (r.get("deploy_uuid") or "") == uuid]
+    return {
+        "uuid": uuid,
+        "resource": (rows[0].get("resource") if rows else "") or uuid,
+        "containers": [r["container"] for r in rows],
+        "kind": known.get(uuid) or "?",
+        "started": time.time(),
+        "started_at": time.strftime("%H:%M:%S"),
+        "status": "submitting",
+        "message": "",
+        "deployment_uuid": None,
+        "deployment_url": None,
+        "polled": 0,
+    }
+
+
 def deploy(uuids):
+    """Trigger deploys and register a job per resource so progress can be followed."""
     results = []
+    known = coolify_resources()
     for uuid in uuids:
-        entry = {"uuid": uuid, "ok": False, "status": 0, "message": ""}
+        job = _job_start(uuid, known)
+        entry = {"uuid": uuid, "resource": job["resource"], "ok": False, "status": 0, "message": ""}
         if not COOLIFY_TOKEN:
             entry["message"] = DEPLOY_HINT
+            job.update(status="error", message=DEPLOY_HINT)
+            DEPLOY_JOBS[uuid] = job
+            results.append(entry)
+            continue
+        if known and uuid not in known:
+            entry["message"] = "uuid is not a resource in this Coolify instance"
+            job.update(status="error", message=entry["message"])
+            DEPLOY_JOBS[uuid] = job
             results.append(entry)
             continue
         url = f"{COOLIFY_API_URL}/api/v1/deploy?uuid={urllib.parse.quote(uuid)}&force=false"
@@ -717,13 +761,27 @@ def deploy(uuids):
         })
         try:
             with urllib.request.urlopen(request, timeout=90) as resp:
-                entry.update(ok=True, status=resp.status, message=resp.read().decode("utf-8", "replace")[:400])
+                body = resp.read().decode("utf-8", "replace")
+                entry.update(ok=True, status=resp.status, message=body[:400])
+                try:
+                    payload = json.loads(body)
+                    first = (payload.get("deployments") or [{}])[0]
+                except Exception:
+                    first = {}
+                job["deployment_uuid"] = first.get("deployment_uuid")
+                job["deployment_url"] = first.get("deployment_url")
+                job["message"] = (first.get("message") or body)[:300]
+                job["status"] = "queued" if job["deployment_uuid"] else "in progress"
         except urllib.error.HTTPError as exc:
-            entry.update(status=exc.code, message=exc.read().decode("utf-8", "replace")[:400])
+            body = exc.read().decode("utf-8", "replace")
+            entry.update(status=exc.code, message=body[:400])
+            job.update(status="error", message=f"HTTP {exc.code}: {body[:300]}")
         except Exception as exc:  # noqa: BLE001
             entry["message"] = f"{type(exc).__name__}: {exc}"
+            job.update(status="error", message=entry["message"][:300])
         with LOCK:
-            DEPLOY_LOG[uuid] = {"at": time.strftime("%H:%M:%S"), "ok": entry["ok"], "message": entry["message"][:200]}
+            DEPLOY_JOBS[uuid] = job
+            DEPLOY_LOG[uuid] = {"at": job["started_at"], "ok": entry["ok"], "message": entry["message"][:200]}
             # a deploy may change what the tags resolve to
             _preview_cache.clear()
             _versions_cache.clear()
@@ -731,9 +789,121 @@ def deploy(uuids):
     return results
 
 
+def _container_created_after(resource, since, old_names):
+    """True when a container of `resource` was (re)created after `since`."""
+    try:
+        containers = docker_get("/containers/json?all=1")
+    except Exception:
+        return False
+    for container in containers:
+        labels = container.get("Labels") or {}
+        if labels.get("coolify.resourceName") != resource:
+            continue
+        name = (container.get("Names") or [""])[0].lstrip("/")
+        created = (container.get("Created") or 0)
+        if created >= since - 1 or name not in old_names:
+            return True
+    return False
+
+
+def poll_deploy_jobs(force=False):
+    """Refresh the status of running deploy jobs (Coolify API or container recreation)."""
+    now = time.time()
+    for job in list(DEPLOY_JOBS.values()):
+        if job.get("status") in TERMINAL_JOB:
+            continue
+        if not force and now - job.get("polled", 0) < 3:
+            continue
+        job["polled"] = now
+        if job.get("deployment_uuid"):
+            request = urllib.request.Request(
+                f"{COOLIFY_API_URL}/api/v1/deployments/{job['deployment_uuid']}",
+                headers={"Authorization": f"Bearer {COOLIFY_TOKEN}", "Accept": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=30) as resp:
+                    dep = json.load(resp)
+                raw = (dep.get("status") or "").lower()
+                job["status"] = COOLIFY_STATUS.get(raw, raw or job["status"])
+                job["deployment_url"] = dep.get("deployment_url") or job.get("deployment_url")
+                if dep.get("finished_at"):
+                    job["finished_at"] = dep["finished_at"]
+            except Exception:
+                pass
+        else:
+            # services have no deployment id: watch for a recreated container
+            if _container_created_after(job["resource"], job["started"], set(job["containers"])):
+                job["status"] = "finished"
+                job["message"] = job.get("message") or "container recreated"
+            elif now - job["started"] > 900:
+                job["status"] = "timeout"
+                job["message"] = "no new container after 15 min, check Coolify"
+    return list(DEPLOY_JOBS.values())
+
+
+def deploy_jobs():
+    jobs = sorted(poll_deploy_jobs(), key=lambda j: j.get("started", 0), reverse=True)
+    ui = os.environ.get("COOLIFY_UI_URL", "").rstrip("/")
+    out = []
+    for job in jobs[:20]:
+        item = {k: v for k, v in job.items() if k not in ("started", "polled")}
+        item["elapsed"] = int(time.time() - job.get("started", time.time()))
+        item["link"] = f"{ui}{job['deployment_url']}" if ui and job.get("deployment_url") else None
+        out.append(item)
+    return out
+
+
+_resources_cache = {}
+CANDIDATE_UUID = re.compile(r"\b[a-z0-9]{20,32}\b")
+
+
+def coolify_resources():
+    """UUIDs of applications, services and databases that Coolify knows about.
+
+    Container labels can point at a project that no longer exists (an app that was
+    recreated), so every deploy candidate is validated against this list.
+    """
+    if not COOLIFY_TOKEN:
+        return {}
+    now = time.time()
+    with LOCK:
+        hit = _resources_cache.get("data")
+        if hit and now - hit[0] < TAGS_TTL:
+            return hit[1]
+    found, ok = {}, 0
+    for kind in ("applications", "services", "databases"):
+        request = urllib.request.Request(
+            f"{COOLIFY_API_URL}/api/v1/{kind}",
+            headers={"Authorization": f"Bearer {COOLIFY_TOKEN}", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as resp:
+                payload = json.load(resp)
+            ok += 1
+            for item in payload or []:
+                if isinstance(item, dict) and item.get("uuid"):
+                    found[item["uuid"]] = kind[:-1]   # application / service / database
+        except Exception:
+            continue
+    if ok:
+        with LOCK:
+            _resources_cache["data"] = (now, found)
+    return found
+
+
+def resolve_deploy_uuid(container_name, project_label, known):
+    """Find the real Coolify resource uuid for a container."""
+    if project_label in known:
+        return project_label
+    # container names are <service>-<resource-uuid>-<timestamp>
+    for candidate in CANDIDATE_UUID.findall(container_name or ""):
+        if candidate in known:
+            return candidate
+    return None
+
+
 def deployable(row):
-    project = row.get("project") or ""
-    return bool(COOLIFY_TOKEN) and bool(re.fullmatch(r"[a-z0-9]{20,32}", project)) and project != "source"
+    return bool(COOLIFY_TOKEN) and bool(row.get("deploy_uuid"))
 
 
 _preview_cache = {}
@@ -757,7 +927,7 @@ def preview(uuids, force=False):
             return payload
     items = {}
     for row in STATE["rows"]:
-        uuid = row.get("project") or ""
+        uuid = row.get("deploy_uuid") or ""
         if uuid not in uuids:
             continue
         entry = items.setdefault(uuid, {
@@ -847,6 +1017,9 @@ PAGE = r"""<!doctype html>
   .p-UPDATE{color:var(--upd);border-color:#d2992255;background:#d299221a}
   .p-ok{color:var(--ok);border-color:#3fb95055;background:#3fb9501a}
   .p-\?\?{color:var(--dim);border-color:var(--line);background:var(--card)}
+  .pill.ok{color:var(--ok);border-color:#3fb95055;background:#3fb9501a}
+  .pill.err{color:#f85149;border-color:#f8514955;background:#f851491a}
+  .pill.upd{color:var(--upd);border-color:#d2992255;background:#d299221a}
   .row-btn{padding:3px 10px;font-size:12px;min-width:96px}
   #deployAll{min-width:196px}
   .spin{display:inline-block;width:11px;height:11px;margin-right:7px;vertical-align:-1px;
@@ -858,13 +1031,13 @@ PAGE = r"""<!doctype html>
          overflow-wrap:anywhere}
   #toast.err{border-color:#f85149}
   dialog{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:0;
-         max-width:920px;width:calc(100% - 40px);max-height:85vh;overscroll-behavior:contain}
+         max-width:920px;width:calc(100% - 40px);max-height:85vh;overflow:hidden;overscroll-behavior:contain}
   dialog::backdrop{background:#0d1117cc}
-  dialog .box{display:flex;flex-direction:column;max-height:85vh}
+  dialog .box{display:flex;flex-direction:column;min-height:0;max-height:calc(85vh - 2px)}
   dialog h2{margin:0;padding:14px 18px;font-size:14px;border-bottom:1px solid var(--line);font-weight:600;
             text-wrap:balance}
   dialog h3{margin:18px 18px 6px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--dim)}
-  dialog .scroll{overflow:auto;overscroll-behavior:contain}
+  dialog .scroll{overflow:auto;min-height:0;overscroll-behavior:contain}
   dialog .scroll>div{padding-bottom:8px}
   dialog table{width:100%}
   dialog td{padding:8px 18px}
@@ -906,6 +1079,7 @@ PAGE = r"""<!doctype html>
   <input type="search" id="q" name="q" autocomplete="off" spellcheck="false"
          placeholder="Filter by container, image or resource…" aria-label="Filter rows">
   <label class="chk"><input type="checkbox" id="onlyUpd" name="outdated" checked> Outdated only</label>
+  <button id="deploys" type="button" aria-haspopup="dialog" aria-controls="progressDialog">Deploys</button>
   <button id="help" type="button" aria-haspopup="dialog" aria-controls="helpDialog">? Help</button>
 </header>
 <div id="banner" role="status"></div>
@@ -934,6 +1108,19 @@ PAGE = r"""<!doctype html>
       <button id="mRefresh" type="button">Refresh</button>
       <button id="mCancel" type="button">Cancel</button>
       <button class="primary" id="mGo" type="button">Deploy</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="progressDialog" aria-labelledby="jobTitle">
+  <div class="box">
+    <h2 id="jobTitle">Deploy Progress</h2>
+    <div class="scroll"><table>
+      <thead><tr><th scope="col">Resource</th><th scope="col">State</th><th scope="col">Elapsed</th><th scope="col">Detail</th></tr></thead>
+      <tbody id="jRows"><tr><td colspan="4" class="dim">Loading…</td></tr></tbody></table></div>
+    <div class="foot">
+      <span class="hint" id="jHint">Updates every 3s while a deploy is running.</span>
+      <button id="jobClose" type="button" class="primary">Close</button>
     </div>
   </div>
 </dialog>
@@ -968,6 +1155,9 @@ PAGE = r"""<!doctype html>
           to today, so you can copy it into the compose.</dd>
         <dt>Update Selected</dt><dd>Same deploy, for every resource you checked. A dialog lists each container with the
           running version and the version it will be on after the pull; nothing is deployed before you confirm.</dd>
+        <dt>Deploys <span class="dim">(header)</span></dt><dd>Progress of the deploys you triggered: Coolify
+          deployment status for applications (queued → in progress → finished/failed, with a link) and container
+          recreation for services. Refreshes every 3s while something is running.</dd>
       </dl>
 
       <h3>Compare against</h3>
@@ -1036,7 +1226,7 @@ function toast(msg, err) {
   clearTimeout(t._h); t._h = setTimeout(() => { t.style.display = "none"; }, 12000);
 }
 function canDeploy(r) {
-  return state.deploy_enabled && /^[a-z0-9]{20,32}$/.test(r.project || "") && r.project !== "source";
+  return Boolean(state.deploy_enabled && r.deploy_uuid);
 }
 function rowStatus(r) {
   if (state.level !== "current" && r.target) return r.target.status;
@@ -1070,7 +1260,7 @@ function render() {
       <td>${targetCell(r)}</td>
       <td><span class="pill p-${esc(st)}">${esc(st)}</span></td>
       <td>${can
-        ? `<button class="row-btn" type="button" data-deploy="${esc(r.project)}"
+        ? `<button class="row-btn" type="button" data-deploy="${esc(r.deploy_uuid)}"
              title="Deploy now: re-pull the compose tag and recreate the container (the compose file is not edited)">Update</button>
            <button class="row-btn" type="button" data-pin="${id}"
              title="Which versioned tag the floating tag points to today">Exact Tag</button>`
@@ -1126,6 +1316,53 @@ async function fetchState() {
   else { $("#check").disabled = false; $("#check").textContent = "Check Now"; }
   if (busy) setTimeout(fetchState, 2500);
 }
+const progressDialog = $("#progressDialog");
+let progressTimer = null;
+const TERMINAL = ["finished", "failed", "cancelled", "error", "timeout"];
+
+function jobClass(status) {
+  const st = (status || "").toLowerCase();
+  if (st === "finished") return "ok";
+  if (st === "failed" || st === "cancelled" || st === "error" || st === "timeout") return "err";
+  return "upd";
+}
+function renderJobs(jobs) {
+  $("#jRows").innerHTML = jobs.length ? jobs.map(j => {
+    const detail = j.message ? esc(j.message) : "";
+    const link = j.link ? ` <a href="${esc(j.link)}" target="_blank" rel="noreferrer noopener">open in Coolify</a>` : "";
+    return `<tr>
+      <td><code translate="no">${esc(j.resource)}</code><span class="sub">${esc(j.kind)} · started ${esc(j.started_at)}</span></td>
+      <td><span class="pill ${jobClass(j.status)}">${esc(j.status)}</span></td>
+      <td>${num.format(j.elapsed || 0)}s</td>
+      <td class="dim">${detail}${link}</td>
+    </tr>`;
+  }).join("") : `<tr><td colspan="4" class="dim">No deploys in this session yet.</td></tr>`;
+  const active = jobs.filter(j => !TERMINAL.includes((j.status || "").toLowerCase())).length;
+  $("#jHint").textContent = active
+    ? `${active} deploy(s) still running — refreshing every 3s.`
+    : "Updates every 3s while a deploy is running.";
+}
+async function refreshJobs() {
+  clearTimeout(progressTimer);
+  try {
+    const data = await (await fetch("api/deploys")).json();
+    const jobs = data.jobs || [];
+    renderJobs(jobs);
+    const active = jobs.some(j => !TERMINAL.includes((j.status || "").toLowerCase()));
+    if (active) progressTimer = setTimeout(refreshJobs, 3000);
+  } catch (e) {
+    toast("Could not read deploy progress: " + e, true);
+    progressTimer = setTimeout(refreshJobs, 6000);
+  }
+}
+function openProgress() {
+  openDialog(progressDialog);
+  refreshJobs();
+}
+$("#deploys").onclick = openProgress;
+$("#jobClose").onclick = () => { clearTimeout(progressTimer); closeDialog(progressDialog); };
+progressDialog.addEventListener("close", () => clearTimeout(progressTimer));
+
 async function doDeploy(uuids, btn) {
   toast("Deploying " + uuids.length + " resource(s)…");
   if (btn) {
@@ -1140,16 +1377,16 @@ async function doDeploy(uuids, btn) {
   const failed = results.filter(x => !x.ok);
   const ok = results.length - failed.length;
   toast(failed.length
-    ? `Deploy failed for ${failed.length} of ${results.length}:\n\n` +
-      failed.map(x => `${x.uuid} (HTTP ${x.status}): ${x.message}`).join("\n\n") +
-      "\n\nCheck /api/state for the deployment log, or open the resource in Coolify."
-    : `Deploy triggered for ${ok} resource(s). Coolify is pulling now; run Check Now in a minute to confirm.`,
+    ? `Deploy failed for ${failed.length} of ${results.length} — see the Deploy Progress dialog.\n\n` +
+      failed.map(x => `${x.resource || x.uuid}: ${x.message}`).join("\n")
+    : `Deploy triggered for ${ok} resource(s). Follow it in Deploy Progress.`,
     failed.length > 0);
   if (btn) {
     btn.removeAttribute("aria-busy");
     btn.disabled = false;
     btn.textContent = "Update";
   }
+  openProgress();
 }
 $("#check").onclick = async () => { $("#check").disabled = true; await fetch("api/check", {method: "POST"}); setTimeout(fetchState, 1200); };
 $("#level").onchange = async e => {
@@ -1250,7 +1487,7 @@ $("#mGo").onclick = () => {
 };
 $("#deployAll").onclick = async () => {
   if (previewBusy) return;
-  const uuids = [...new Set(rows.filter(r => sel.has(r.container) && canDeploy(r)).map(r => r.project))];
+  const uuids = [...new Set(rows.filter(r => sel.has(r.container) && canDeploy(r)).map(r => r.deploy_uuid))];
   if (!uuids.length) return;
   previewBusy = true;
   setDeployAllState();
@@ -1330,6 +1567,11 @@ class Handler(BaseHTTPRequestHandler):
                 version=VERSION,
             )
             return self._send(200, json.dumps(payload))
+        if path == "/api/deploys":
+            try:
+                return self._send(200, json.dumps({"jobs": deploy_jobs()}))
+            except Exception as exc:  # noqa: BLE001
+                return self._fail(502, f"{type(exc).__name__}: {exc}")
         return self._fail(404, "not found")
 
     def do_POST(self):
