@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 APP_NAME = "coolify-updates-manager"
 
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -575,6 +575,33 @@ def save_state():
         print(f"warn: could not write state file: {exc}", flush=True)
 
 
+def container_url(inspect):
+    """Public URL of a container: Traefik Host rule first, then COOLIFY_URL."""
+    config = inspect.get("Config") or {}
+    labels = config.get("Labels") or {}
+    hosts, secure_hosts = [], []
+    for key, value in labels.items():
+        if not (key.startswith("traefik.http.routers.") and key.endswith(".rule")):
+            continue
+        base = key[: -len(".rule")]
+        for host in re.findall(r"Host\(`([^`]+)`\)", value or ""):
+            hosts.append(host)
+            if labels.get(base + ".tls") == "true":
+                secure_hosts.append(host)
+    if secure_hosts:
+        return f"https://{secure_hosts[0]}"
+    if hosts:
+        return f"https://{hosts[0]}"
+    env = {}
+    for item in config.get("Env") or []:
+        key, _, value = item.partition("=")
+        env[key] = value
+    url = (env.get("COOLIFY_URL") or "").split(",")[0].strip()
+    if url.startswith("http") and "." in url and "docker.internal" not in url:
+        return url
+    return ""
+
+
 def _image_facts(image_id):
     try:
         image = docker_get(f"/images/{image_id}/json") if image_id else {}
@@ -606,6 +633,7 @@ def collect():
         prepared.append({
             "container": name,
             "ref": ref,
+            "url": container_url(inspect),
             "project": labels.get("com.docker.compose.project", ""),
             "resource": labels.get("coolify.resourceName", ""),
             "type": labels.get("coolify.type", ""),
@@ -650,6 +678,7 @@ def collect():
             "remote_digest": remote or "",
             "digests": local,
             "project": item["project"],
+            "url": item.get("url") or "",
             "deploy_uuid": deploy_uuid,
             "resource": item["resource"],
             "type": item["type"],
@@ -1079,6 +1108,9 @@ PAGE = r"""<!doctype html>
   main th{position:sticky;top:57px;background:var(--bg);z-index:1}
   tr.upd td{background:#d299220d}
   code{color:#a5d6ff;overflow-wrap:anywhere}
+  main td a, dialog td a{color:var(--link);text-decoration:underline;text-underline-offset:2px;
+         text-decoration-color:#58a6ff66;overflow-wrap:anywhere}
+  main td a:hover, dialog td a:hover{text-decoration-color:var(--link)}
   .sub{display:block;color:var(--dim);font-size:12px;overflow-wrap:anywhere}
   .pill{display:inline-block;padding:1px 7px;border-radius:999px;font-size:12px;border:1px solid}
   .p-UPDATE{color:var(--upd);border-color:#d2992255;background:#d299221a}
@@ -1199,7 +1231,9 @@ PAGE = r"""<!doctype html>
       <h3>Columns</h3>
       <dl class="doc">
         <dt>Resource</dt><dd>The Coolify resource that owns the container (labels <code>coolify.resourceName</code>
-          and <code>com.docker.compose.project</code>). The container name sits right below it.</dd>
+          and <code>com.docker.compose.project</code>). The container name sits right below it. When the container has
+          a public address (Traefik <code>Host</code> rule or <code>COOLIFY_URL</code>) the name is a link that opens
+          it in a new tab.</dd>
         <dt>Image</dt><dd>The image reference the container was created with.</dd>
         <dt>In Use</dt><dd>Tag policy plus the version reported by the image label. Policies:
           <b>floating</b> (<code>latest</code>, <code>stable</code>, <code>release</code>, or no tag — moves on its own),
@@ -1299,6 +1333,13 @@ function rowStatus(r) {
   if (state.level !== "current" && r.target) return r.target.status;
   return r.status;
 }
+function resourceCell(r) {
+  const name = r.resource || r.project || (r.url ? r.url.replace(/^https?:\/\//, "") : "");
+  if (!name && !r.url) return '<span class="dim">—</span>';
+  if (!r.url) return `<code translate="no">${esc(name)}</code>`;
+  return `<a href="${esc(r.url)}" target="_blank" rel="noopener noreferrer" translate="no"
+             title="Open ${esc(r.url)} in a new tab">${esc(name)}<span aria-hidden="true"> ↗</span></a>`;
+}
 function targetCell(r) {
   if (state.level === "current") return '<span class="dim">-</span>';
   if (!r.target) return '<span class="dim">pending</span>';
@@ -1319,8 +1360,7 @@ function render() {
     return `<tr class="${st === "UPDATE" ? "upd" : ""}">
       <td>${can ? `<input type="checkbox" data-c="${id}" ${sel.has(r.container) ? "checked" : ""}
              aria-label="Select ${id}">` : ""}</td>
-      <td>${can ? `<code translate="no">${esc(r.resource || r.project)}</code>` : `<span class="dim">${esc(r.resource || "—")}</span>`}
-          <span class="sub">${id}</span></td>
+      <td>${resourceCell(r)}<span class="sub">${id}</span></td>
       <td><code translate="no">${esc(r.image)}</code></td>
       <td><span class="tag ${esc(r.policy)}">${esc(r.policy)}</span>
           <span class="sub">${esc(running) || "—"}</span></td>
