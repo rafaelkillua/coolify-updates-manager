@@ -65,6 +65,7 @@ Everything is optional; the defaults give you a read-only dashboard.
 | `UPDATES_TAGS_TTL` | `21600` | — | how long a registry tag list is cached, seconds |
 | `UPDATES_DIGEST_TTL` | `900` | — | how long a manifest digest is cached, seconds |
 | `UPDATES_PREVIEW_TTL` | `300` | — | how long a computed deploy-dialog preview is reused for the same selection |
+| `UPDATES_VERSIONS_TTL` | `300` | — | how long the running/next version of each image is cached |
 
 ### Which ones do I actually need?
 

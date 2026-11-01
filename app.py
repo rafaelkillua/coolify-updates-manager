@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 APP_NAME = "coolify-updates-manager"
 
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -46,6 +46,7 @@ CHECK_TIMEOUT = int(os.environ.get("UPDATES_TIMEOUT", "60"))
 TAGS_TTL = int(os.environ.get("UPDATES_TAGS_TTL", "21600"))      # registry tag list
 DIGEST_TTL = int(os.environ.get("UPDATES_DIGEST_TTL", "900"))    # manifest digest
 PREVIEW_TTL = int(os.environ.get("UPDATES_PREVIEW_TTL", "300"))  # deploy dialog preview
+VERSIONS_TTL = int(os.environ.get("UPDATES_VERSIONS_TTL", "300"))  # running/next per image
 
 DEPLOY_HINT = "" if COOLIFY_TOKEN else "deploy disabled: COOLIFY_TOKEN is not set"
 
@@ -361,6 +362,67 @@ def version_after_pull(row):
     return ""
 
 
+_versions_cache = {}
+WARMING = threading.Event()
+WARM = {"total": 0, "done": 0}
+
+
+def _versions_key(row):
+    return (row["image"], row.get("tag") or "", tuple((row.get("digests") or [])[:2]))
+
+
+def version_facts(row):
+    """Running version and next version for one row, cached for VERSIONS_TTL.
+
+    Resolving these can cost a dozen registry requests (digest lookups), so the
+    result is reused across dialog opens and across selections.
+    """
+    key = _versions_key(row)
+    now = time.time()
+    with LOCK:
+        hit = _versions_cache.get(key)
+        if hit and now - hit[0] < VERSIONS_TTL:
+            return hit[1]
+    facts = {"running": version_running(row), "next": version_after_pull(row)}
+    with LOCK:
+        _versions_cache[key] = (now, facts)
+    return facts
+
+
+def warm_versions():
+    """Resolve versions for every row in the background, right after a check.
+
+    Keeps the deploy dialog instant: by the time someone clicks, the expensive
+    lookups are already cached for VERSIONS_TTL.
+    """
+    if WARMING.is_set():
+        return False
+    WARMING.set()
+
+    def work():
+        try:
+            rows = [r for r in list(STATE["rows"]) if r.get("digests") or r.get("remote_digest")]
+            with LOCK:
+                WARM.update(total=len(rows), done=0)
+
+            def one(row):
+                try:
+                    newest_release(row)
+                    version_facts(row)
+                except Exception:
+                    pass
+                with LOCK:
+                    WARM["done"] += 1
+
+            with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+                list(pool.map(one, rows))
+        finally:
+            WARMING.clear()
+
+    threading.Thread(target=work, daemon=True).start()
+    return True
+
+
 def newest_release(row):
     """Exact tag the image's channel points to today (e.g. v3.5.1 for :latest).
 
@@ -604,6 +666,7 @@ def run_check():
             )
             if STATE["level"] != "current":
                 resolve_rows(STATE["level"])
+            warm_versions()
         except Exception as exc:  # noqa: BLE001
             STATE.update(error=f"{type(exc).__name__}: {exc}")
         with LOCK:
@@ -661,7 +724,9 @@ def deploy(uuids):
             entry["message"] = f"{type(exc).__name__}: {exc}"
         with LOCK:
             DEPLOY_LOG[uuid] = {"at": time.strftime("%H:%M:%S"), "ok": entry["ok"], "message": entry["message"][:200]}
-            _preview_cache.clear()   # a deploy may change what the tags resolve to
+            # a deploy may change what the tags resolve to
+            _preview_cache.clear()
+            _versions_cache.clear()
         results.append(entry)
     return results
 
@@ -701,12 +766,13 @@ def preview(uuids, force=False):
             "state": row.get("status"),
             "containers": [],
         })
+        facts = version_facts(row)
         entry["containers"].append({
             "container": row["container"],
             "image": row["image"],
             "status": row.get("status"),
-            "running": version_running(row),
-            "next": version_after_pull(row),
+            "running": facts["running"],
+            "next": facts["next"],
         })
     payload = {"items": [items[k] for k in uuids if k in items], "cached": False, "age": 0, "ttl": PREVIEW_TTL}
     with LOCK:
@@ -725,6 +791,7 @@ def config_view():
         "tags_ttl": TAGS_TTL,
         "digest_ttl": DIGEST_TTL,
         "preview_ttl": PREVIEW_TTL,
+        "versions_ttl": VERSIONS_TTL,
         "bind": f"{BIND}:{PORT}",
     }
 
@@ -1042,6 +1109,8 @@ function renderConfig() {
     `&nbsp; deploy=<b>${c.deploy_enabled ? "enabled" : "disabled"}</b> ` +
     `&nbsp; state=<code>${esc(c.state_file)}</code> ` +
     `&nbsp; workers=${c.workers} timeout=${c.timeout}s ttl tags=${c.tags_ttl}s digest=${c.digest_ttl}s ` +
+    `preview=${c.preview_ttl}s versions=${c.versions_ttl}s ` +
+    `&nbsp; ${state.warming ? `warming versions ${(state.warm || {}).done || 0}/${(state.warm || {}).total || 0}` : "versions warm"} ` +
     `&nbsp; v${esc(state.version)}`;
 }
 async function fetchState() {
@@ -1251,6 +1320,8 @@ class Handler(BaseHTTPRequestHandler):
                 STATE,
                 checking=CHECKING.is_set(),
                 resolving=RESOLVING.is_set(),
+                warming=WARMING.is_set(),
+                warm=dict(WARM),
                 deploy_enabled=bool(COOLIFY_TOKEN),
                 deploy_hint=DEPLOY_HINT,
                 deploy_log=DEPLOY_LOG,
@@ -1318,6 +1389,8 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     load_state()
+    if STATE["rows"]:
+        warm_versions()   # cached rows from a previous run: warm the version data
     print(f"{APP_NAME} {VERSION} listening on http://{BIND}:{PORT} | coolify={COOLIFY_API_URL or '-'} "
           f"| state={STATE_FILE} | level={STATE['level']}", flush=True)
     if DEPLOY_HINT:
