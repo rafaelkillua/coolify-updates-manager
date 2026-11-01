@@ -1,0 +1,34 @@
+services:
+  updates-web:
+    build:
+      context: .
+    image: updates-web:latest
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # API base of your Coolify instance. Do NOT use the name COOLIFY_URL:
+      # Coolify reserves it and injects the public URL of this app into it.
+      # Alternative inside Coolify: http://coolify:8000 on the "coolify" network.
+      COOLIFY_API_URL: ${COOLIFY_API_URL:-http://host.docker.internal:8000}
+      # token with the "deploy" ability. Leave it empty to run read-only:
+      # the dashboard then only reports updates and hides the deploy buttons.
+      COOLIFY_TOKEN: ${COOLIFY_TOKEN:-}
+      UPDATES_STATE: /data/state.json
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # read-only access to the local Docker daemon
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - updates-data:/data
+    expose:
+      - "8799"
+
+volumes:
+  updates-data:
