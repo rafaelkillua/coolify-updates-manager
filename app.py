@@ -652,6 +652,20 @@ def resolve_rows(level):
     STATE["resolved_at"][level] = time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _finish_check(rows, counts, started):
+    STATE.update(
+        checked_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+        checked_at_epoch=int(time.time()),
+        duration=round(time.time() - started, 1),
+        rows=rows,
+        counts=counts,
+        error=None,
+    )
+    with LOCK:
+        _preview_cache.clear()   # rows changed, any cached preview is stale
+    save_state()                 # persist before the slow parts start
+
+
 def run_check():
     if CHECKING.is_set():
         return False
@@ -661,37 +675,25 @@ def run_check():
         started = time.time()
         try:
             rows, counts = collect()
-            STATE.update(
-                checked_at=time.strftime("%Y-%m-%d %H:%M:%S"),
-                checked_at_epoch=int(time.time()),
-                duration=round(time.time() - started, 1),
-                rows=rows,
-                counts=counts,
-                error=None,
-            )
-            if STATE["level"] != "current":
-                resolve_rows(STATE["level"])
+            _finish_check(rows, counts, started)
+            CHECKING.clear()     # the table is usable now
+            # slow parts run in the background so the button never blocks on them
+            start_resolve()
             warm_versions()
         except Exception as exc:  # noqa: BLE001
             STATE.update(error=f"{type(exc).__name__}: {exc}")
-        with LOCK:
-            _preview_cache.clear()   # rows changed, any cached preview is stale
-        save_state()
-        CHECKING.clear()
+            save_state()
+            CHECKING.clear()
 
     threading.Thread(target=work, daemon=True).start()
     return True
 
 
-def set_level(level):
-    if level not in LEVELS or level == STATE["level"]:
+def start_resolve():
+    """Fill the target column for the selected level, in the background."""
+    level = STATE["level"]
+    if level == "current" or not STATE["rows"] or RESOLVING.is_set():
         return False
-    if RESOLVING.is_set():
-        return False
-    STATE["level"] = level
-    save_state()
-    if level == "current" or not STATE["rows"]:
-        return True
     RESOLVING.set()
 
     def work():
@@ -703,6 +705,18 @@ def set_level(level):
         RESOLVING.clear()
 
     threading.Thread(target=work, daemon=True).start()
+    return True
+
+
+def set_level(level):
+    if level not in LEVELS or level == STATE["level"]:
+        return False
+    STATE["level"] = level
+    save_state()
+    if level == "current":
+        resolve_rows("current")
+        return True
+    start_resolve()
     return True
 
 
