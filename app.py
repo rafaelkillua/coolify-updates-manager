@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.9.1"
+VERSION = "2.9.2"
 APP_NAME = "coolify-updates-manager"
 
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -1478,6 +1478,11 @@ function render() {
         : `<span class="dim">${esc(r.note || "not deployable")}</span>`}</td>
     </tr>`;
   }).join("") : `<tr><td colspan="7" class="dim">No rows match the current filter.</td></tr>`;
+  // keep the select-all box honest: render() also runs after deploys clear the selection
+  const selectable = list.filter(canDeploy);
+  const checkedVisible = selectable.filter(r => sel.has(r.container)).length;
+  $("#all").checked = selectable.length > 0 && checkedVisible === selectable.length;
+  $("#all").indeterminate = checkedVisible > 0 && checkedVisible < selectable.length;
   const outdated = rows.filter(r => rowStatus(r) === "UPDATE").length;
   $("#targetHead").textContent = state.level === "current" ? "Target" : "Target (" + LEVEL_NAMES[state.level] + ")";
   const ignored = state.ignored ? ` · ${num.format(state.ignored)} hidden` : "";
@@ -1619,6 +1624,7 @@ $("#onlyUpd").onchange = () => { render(); syncUrl(); };
 $("#all").onchange = e => {
   sel.clear();
   if (e.target.checked) document.querySelectorAll("[data-c]").forEach(c => sel.add(c.dataset.c));
+  e.target.indeterminate = false;
   render();
 };
 document.addEventListener("change", e => {
