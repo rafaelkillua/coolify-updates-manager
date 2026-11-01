@@ -45,6 +45,7 @@ comparison levels — the same content as below, for whoever is looking at the d
 | **exact tag** (one row) | Shows which versioned tag the floating tag points to today, so you can copy it into the compose. Read-only. |
 | **compare against** | Switches what the *target* column resolves to (`current tag` / newest `major` line / newest `minor` line). This is what decides `UPDATE` vs `ok`. |
 | **Update selected** | Same deploy, for the resources you checked. Opens a dialog listing every container with the running version and the version it will be on after the pull, and waits for confirmation. |
+| **Deploys** | Progress of what you triggered: Coolify deployment status for applications (queued → in progress → finished/failed, with a link into Coolify) and container recreation for services, refreshed every 3 s while something runs. |
 
 The deploy never rewrites your compose. If you want the tag pinned, take the value from the *target* column (or from `exact tag`) and edit the compose yourself.
 
@@ -56,6 +57,7 @@ Everything is optional; the defaults give you a read-only dashboard.
 |---|---|---|---|
 | `COOLIFY_TOKEN` | — | deploy buttons | Coolify API token with the `deploy` ability. Empty = read-only mode |
 | `COOLIFY_API_URL` | `http://host.docker.internal:8000` | deploy buttons | Coolify API base URL as seen **from inside the container** |
+| `COOLIFY_UI_URL` | — | links in the progress dialog | Coolify UI base (e.g. `https://coolify.example.com`) used to build "open in Coolify" links |
 | `DOCKER_SOCK` | `/var/run/docker.sock` | always | path to the Docker socket *inside the container* |
 | `UPDATES_STATE` | `/data/state.json` | — | where the last result is cached (mount a volume) |
 | `UPDATES_PORT` | `8799` | — | listening port |
