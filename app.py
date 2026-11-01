@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 APP_NAME = "coolify-updates-manager"
 
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -440,6 +440,7 @@ def resolve_level(row, level):
 # --------------------------------------------------------------- collector --
 STATE = {
     "checked_at": None,
+    "checked_at_epoch": None,
     "duration": None,
     "rows": [],
     "counts": {"UPDATE": 0, "ok": 0, "??": 0},
@@ -594,6 +595,7 @@ def run_check():
             rows, counts = collect()
             STATE.update(
                 checked_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                checked_at_epoch=int(time.time()),
                 duration=round(time.time() - started, 1),
                 rows=rows,
                 counts=counts,
@@ -704,31 +706,41 @@ def config_view():
 
 # -------------------------------------------------------------------- http --
 PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="en" style="color-scheme:dark"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>coolify updates manager</title>
+<meta name="theme-color" content="#0d1117">
+<title>Coolify Updates Manager</title>
 <style>
-  :root{--bg:#0d1117;--card:#161b22;--line:#30363d;--fg:#e6edf3;--dim:#8b949e;--ok:#3fb950;--upd:#d29922}
+  :root{--bg:#0d1117;--card:#161b22;--line:#30363d;--fg:#e6edf3;--dim:#9ba6b2;--ok:#3fb950;--upd:#d29922;--link:#58a6ff}
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
-  header{position:sticky;top:0;background:#0d1117ee;backdrop-filter:blur(6px);border-bottom:1px solid var(--line);
+  html{overscroll-behavior:none}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+       font-variant-numeric:tabular-nums}
+  a{color:var(--link)}
+  :focus-visible{outline:2px solid var(--link);outline-offset:2px;border-radius:4px}
+  .skip{position:absolute;left:-9999px;top:0;background:var(--card);border:1px solid var(--line);padding:8px 12px;z-index:60}
+  .skip:focus{left:8px;top:8px}
+  header{position:sticky;top:0;background:#0d1117f2;backdrop-filter:blur(6px);border-bottom:1px solid var(--line);
          padding:14px 20px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;z-index:5}
-  h1{font-size:15px;margin:0;font-weight:600}
+  h1{font-size:15px;margin:0;font-weight:600;text-wrap:balance}
   .dim{color:var(--dim)}
   .tag{display:inline-block;padding:0 6px;border-radius:4px;font-size:11px;letter-spacing:.03em;text-transform:uppercase;
        border:1px solid var(--line);color:var(--dim)}
-  .tag.floating{color:#d29922;border-color:#d2992255}
+  .tag.floating{color:var(--upd);border-color:#d2992255}
   .tag.major{color:#79c0ff;border-color:#79c0ff55}
   .tag.minor{color:#a5d6ff;border-color:#a5d6ff44}
-  .tag.exact{color:#3fb950;border-color:#3fb95055}
-  .tag.digest,.tag.custom{color:#8b949e}
-  button{background:#21262d;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 12px;font:inherit;cursor:pointer}
-  button:hover:not(:disabled){background:#30363d}
-  button:disabled{opacity:.45;cursor:default}
+  .tag.exact{color:var(--ok);border-color:#3fb95055}
+  .tag.digest,.tag.custom{color:var(--dim)}
+  button{background:#21262d;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 12px;font:inherit;
+         cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:#ffffff1a}
+  button:hover:not(:disabled){background:#30363d;border-color:#484f58}
+  button:active:not(:disabled){background:#282e36}
+  button:disabled{opacity:.45;cursor:not-allowed}
   button.primary{background:#1f6feb;border-color:#1f6feb}
-  button.primary:hover:not(:disabled){background:#388bfd}
-  select{background:#21262d;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}
-  main{padding:16px 20px 70px}
+  button.primary:hover:not(:disabled){background:#388bfd;border-color:#388bfd}
+  select{background:#21262d;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit;
+         touch-action:manipulation}
+  main{padding:16px 20px 70px;scroll-margin-top:70px}
   #banner{display:none;margin:0 20px 14px;padding:8px 12px;border:1px solid #d2992255;background:#d299221a;
           color:var(--upd);border-radius:6px;font-size:13px}
   table{border-collapse:collapse;width:100%}
@@ -736,97 +748,188 @@ PAGE = r"""<!doctype html>
   th{color:var(--dim);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.04em;
      position:sticky;top:57px;background:var(--bg)}
   tr.upd td{background:#d299220d}
-  code{color:#a5d6ff}
-  .sub{display:block;color:var(--dim);font-size:12px}
+  code{color:#a5d6ff;overflow-wrap:anywhere}
+  .sub{display:block;color:var(--dim);font-size:12px;overflow-wrap:anywhere}
   .pill{display:inline-block;padding:1px 7px;border-radius:999px;font-size:12px;border:1px solid}
   .p-UPDATE{color:var(--upd);border-color:#d2992255;background:#d299221a}
   .p-ok{color:var(--ok);border-color:#3fb95055;background:#3fb9501a}
-  .p-\?\?{color:var(--dim);border-color:#30363d;background:#161b22}
+  .p-\?\?{color:var(--dim);border-color:var(--line);background:var(--card)}
   .row-btn{padding:3px 10px;font-size:12px}
   #toast{position:fixed;right:16px;bottom:16px;max-width:640px;background:var(--card);border:1px solid var(--line);
-         border-radius:8px;padding:12px 14px;font-size:13px;display:none;white-space:pre-wrap;z-index:20}
+         border-radius:8px;padding:12px 14px;font-size:13px;display:none;white-space:pre-wrap;z-index:40;
+         overflow-wrap:anywhere}
   #toast.err{border-color:#f85149}
-  #modal{position:fixed;inset:0;background:#0d1117cc;display:none;align-items:center;justify-content:center;
-         z-index:30;padding:20px}
-  #modal.open{display:flex}
-  #modal .box{background:var(--card);border:1px solid var(--line);border-radius:10px;max-width:920px;width:100%;
-         max-height:85vh;display:flex;flex-direction:column}
-  #modal h2{margin:0;padding:14px 18px;font-size:14px;border-bottom:1px solid var(--line);font-weight:600}
-  #modal .scroll{overflow:auto}
-  #modal table{width:100%}
-  #modal td{padding:8px 18px}
-  #modal .foot{display:flex;gap:10px;justify-content:flex-end;align-items:center;padding:14px 18px;
+  dialog{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:0;
+         max-width:920px;width:calc(100% - 40px);max-height:85vh;overscroll-behavior:contain}
+  dialog::backdrop{background:#0d1117cc}
+  dialog .box{display:flex;flex-direction:column;max-height:85vh}
+  dialog h2{margin:0;padding:14px 18px;font-size:14px;border-bottom:1px solid var(--line);font-weight:600;
+            text-wrap:balance}
+  dialog h3{margin:18px 18px 6px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--dim)}
+  dialog .scroll{overflow:auto;overscroll-behavior:contain}
+  dialog .scroll>div{padding-bottom:8px}
+  dialog table{width:100%}
+  dialog td{padding:8px 18px}
+  dialog .foot{display:flex;gap:10px;justify-content:flex-end;align-items:center;padding:14px 18px;
          border-top:1px solid var(--line)}
-  #modal .foot .hint{margin-right:auto;color:var(--dim);font-size:12px}
+  dialog .foot .hint{margin-right:auto;color:var(--dim);font-size:12px}
+  .doc{padding:0 18px;color:var(--dim);font-size:13px}
+  .doc p{margin:6px 0}
+  .doc dt{color:var(--fg);margin-top:10px}
+  .doc dd{margin:2px 0 0 0}
+  .doc code{color:#a5d6ff}
   .arrow{color:var(--dim);padding:0 6px}
   .warn{color:var(--upd)}
-  details.help{margin:0 20px 14px;color:var(--dim);font-size:13px}
-  details.help summary{cursor:pointer;color:var(--fg)}
-  details.help ul{margin:8px 0 0 18px;padding:0}
-  details.help li{margin:4px 0}
-  details.help code{color:#a5d6ff}
   input[type=search]{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:6px;
          padding:6px 10px;font:inherit;min-width:200px}
+  input[type=search]:focus-visible{border-color:var(--link)}
   label.chk{display:flex;gap:6px;align-items:center;color:var(--dim);cursor:pointer}
   footer{padding:14px 20px 30px;color:var(--dim);font-size:12px;border-top:1px solid var(--line)}
-  footer b{color:#e6edf3;font-weight:500}
+  footer b{color:var(--fg);font-weight:500}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
+<a class="skip" href="#main">Skip to content</a>
 <header>
-  <h1>coolify updates manager</h1>
-  <span class="dim" id="meta">loading...</span>
-  <button id="check">Check now</button>
-  <label class="chk">compare against
-    <select id="level">
+  <h1>Coolify Updates Manager</h1>
+  <span class="dim" id="meta">Loading…</span>
+  <button id="check" type="button">Check Now</button>
+  <label class="chk">Compare against
+    <select id="level" name="level">
       <option value="current">current tag</option>
       <option value="major">major line</option>
       <option value="minor">minor line</option>
     </select>
   </label>
-  <button class="primary" id="deployAll" disabled>Update selected</button>
-  <input type="search" id="q" placeholder="filter container / image / resource">
-  <label class="chk"><input type="checkbox" id="onlyUpd" checked> outdated only</label>
+  <button class="primary" id="deployAll" type="button" disabled>Update Selected</button>
+  <input type="search" id="q" name="q" autocomplete="off" spellcheck="false"
+         placeholder="Filter by container, image or resource…" aria-label="Filter rows">
+  <label class="chk"><input type="checkbox" id="onlyUpd" name="outdated" checked> Outdated only</label>
+  <button id="help" type="button" aria-haspopup="dialog" aria-controls="helpDialog">? Help</button>
 </header>
-<div id="banner"></div>
-<details class="help"><summary>what does each action do?</summary><ul>
-  <li><b>Check now</b> — re-reads the Docker daemon and asks each registry for the current digest of the tag.
-      Pulls nothing, changes nothing.</li>
-  <li><b>update</b> (row) — deploys that Coolify resource immediately
-      (<code>POST /api/v1/deploy?uuid=…</code>): Coolify re-pulls the tag written in your compose and
-      recreates the container. Your compose is not edited.</li>
-  <li><b>exact tag</b> (row) — which versioned tag the floating tag points to today, for you to copy into
-      the compose.</li>
-  <li><b>compare against</b> — what the <i>target</i> column resolves to (current tag / newest major line /
-      newest minor line); this is what decides <code>UPDATE</code> vs <code>ok</code>.</li>
-  <li><b>Update selected</b> — the same deploy for several resources, after showing what each one will become.</li>
-</ul></details>
-<main><table>
+<div id="banner" role="status"></div>
+<main id="main"><table>
+  <caption class="dim" style="text-align:left;padding:0 0 8px">
+    One row per container. <b>In use</b> is the tag policy and version you are running;
+    <b>Target</b> is the tag to write in the compose file for the selected comparison level.
+  </caption>
   <thead><tr>
-    <th style="width:28px"><input type="checkbox" id="all"></th>
-    <th>resource</th><th>image</th><th>in use</th><th id="targetHead">target</th><th>state</th><th>actions</th>
+    <th style="width:28px"><input type="checkbox" id="all" aria-label="Select all visible rows"></th>
+    <th scope="col">Resource</th><th scope="col">Image</th><th scope="col">In Use</th>
+    <th scope="col" id="targetHead">Target</th><th scope="col">State</th><th scope="col">Actions</th>
   </tr></thead>
-  <tbody id="rows"><tr><td colspan="7" class="dim">loading...</td></tr></tbody>
+  <tbody id="rows"><tr><td colspan="7" class="dim">Loading…</td></tr></tbody>
 </table></main>
 <footer id="config"></footer>
-<div id="modal"><div class="box">
-  <h2 id="mTitle">Deploy?</h2>
-  <div class="scroll"><table><thead><tr><th>resource</th><th>image</th><th>running → after deploy</th></tr></thead>
-    <tbody id="mRows"></tbody></table></div>
-  <div class="foot">
-    <span class="hint" id="mHint"></span>
-    <button id="mCancel">Cancel</button>
-    <button class="primary" id="mGo">Deploy</button>
+
+<dialog id="deployDialog" aria-labelledby="mTitle">
+  <div class="box">
+    <h2 id="mTitle">Deploy Resources</h2>
+    <div class="scroll"><table>
+      <thead><tr><th scope="col">Resource</th><th scope="col">Image</th><th scope="col">Running → After Deploy</th></tr></thead>
+      <tbody id="mRows"></tbody></table></div>
+    <div class="foot">
+      <span class="hint" id="mHint"></span>
+      <button id="mCancel" type="button">Cancel</button>
+      <button class="primary" id="mGo" type="button">Deploy</button>
+    </div>
   </div>
-</div></div>
-<div id="toast"></div>
+</dialog>
+
+<dialog id="helpDialog" aria-labelledby="helpTitle">
+  <div class="box">
+    <h2 id="helpTitle">Help</h2>
+    <div class="scroll">
+      <h3>Columns</h3>
+      <dl class="doc">
+        <dt>Resource</dt><dd>The Coolify resource that owns the container (labels <code>coolify.resourceName</code>
+          and <code>com.docker.compose.project</code>). The container name sits right below it.</dd>
+        <dt>Image</dt><dd>The image reference the container was created with.</dd>
+        <dt>In Use</dt><dd>Tag policy plus the version reported by the image label. Policies:
+          <b>floating</b> (<code>latest</code>, <code>stable</code>, <code>release</code>, or no tag — moves on its own),
+          <b>major</b> (<code>v2</code>, <code>pg16</code>), <b>minor</b> (<code>18.6-alpine</code>, <code>v3.7</code>),
+          <b>exact</b> (<code>4.5.3</code>), <b>digest</b>, <b>custom</b>.</dd>
+        <dt>Target</dt><dd>Only shown when the comparison level is not <i>current tag</i>: the tag to write in your
+          compose to pin at that level, and the version that line currently resolves to.</dd>
+        <dt>State</dt><dd><b>UPDATE</b> — what you run is not what the target points to. <b>ok</b> — you are already
+          on it. <b>??</b> — unknown: local build, no registry, or no versioned tag published.</dd>
+      </dl>
+
+      <h3>Actions</h3>
+      <dl class="doc">
+        <dt>Check Now</dt><dd>Re-reads the Docker daemon and asks each registry for the current digest of the tag.
+          Nothing is pulled and nothing changes.</dd>
+        <dt>update <span class="dim">(one row)</span></dt><dd>Deploys that resource right away —
+          <code>POST /api/v1/deploy?uuid=…</code>. Coolify re-pulls the tag written in your compose and recreates
+          the container. <b>Your compose file is not edited.</b></dd>
+        <dt>exact tag <span class="dim">(one row)</span></dt><dd>Read-only: which versioned tag the floating tag points
+          to today, so you can copy it into the compose.</dd>
+        <dt>Update Selected</dt><dd>Same deploy, for every resource you checked. A dialog lists each container with the
+          running version and the version it will be on after the pull; nothing is deployed before you confirm.</dd>
+      </dl>
+
+      <h3>Compare against</h3>
+      <div class="doc">
+        <p>Changes what <b>Target</b> resolves to, and therefore what counts as <code>UPDATE</code>:</p>
+        <dl>
+          <dt>current tag</dt><dd>Compares the running image with the tag exactly as written in your compose
+            (e.g. <code>:latest</code>).</dd>
+          <dt>major line</dt><dd>Newest release inside the current major (e.g. <code>v3</code>), for pinning
+            <code>v3</code> in the compose.</dd>
+          <dt>minor line</dt><dd>Newest release inside the current minor (e.g. <code>v3.5</code>), the usual balance
+            between stability and patches.</dd>
+        </dl>
+        <p>The target always comes from the newest release the registry offers, not from what you are running. If the
+          project publishes only full versions, the target falls back to the exact tag and the cell says so.</p>
+      </div>
+
+      <h3>Good to Know</h3>
+      <div class="doc">
+        <p>Deploying never rewrites the compose. To pin a version, take it from <b>Target</b> or from
+          <b>exact tag</b> and edit the compose yourself.</p>
+        <p>Docker Hub limits anonymous manifest requests (100 per 6&nbsp;h per IP). A full check spends one request
+          per Hub image; the footer shows the worker count and cache TTLs in use.</p>
+        <p>Rows with <code>??</code> are images built locally or projects that publish a single channel with no
+          versioned tags — there is nothing to compare against.</p>
+      </div>
+    </div>
+    <div class="foot">
+      <span class="hint">Everything here is also valid as a plain API call — see <code>/api/state</code>.</span>
+      <button id="helpClose" type="button" class="primary">Close</button>
+    </div>
+  </div>
+</dialog>
+
+<div id="toast" role="status" aria-live="polite"></div>
 <script>
-let rows = [], state = {}, sel = new Set();
+let rows = [], state = {}, sel = new Set(), lastFocus = null;
 const $ = s => document.querySelector(s);
 const esc = s => (s ?? "").toString().replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const LEVEL_NAMES = {current: "current tag", major: "major line", minor: "minor line"};
+const num = new Intl.NumberFormat();
+const fmtTime = (epoch, fallback) => epoch
+  ? new Intl.DateTimeFormat(undefined, {dateStyle: "short", timeStyle: "medium"}).format(new Date(epoch * 1000))
+  : (fallback || "—");
+function syncUrl() {
+  const p = new URLSearchParams();
+  if (state.level && state.level !== "current") p.set("level", state.level);
+  if ($("#q").value.trim()) p.set("q", $("#q").value.trim());
+  if (!$("#onlyUpd").checked) p.set("outdated", "0");
+  const qs = p.toString();
+  history.replaceState(null, "", qs ? "?" + qs : location.pathname);
+}
+function openDialog(el) {
+  lastFocus = document.activeElement;
+  el.showModal();
+}
+function closeDialog(el) {
+  el.close();
+  if (lastFocus && lastFocus.focus) lastFocus.focus();
+}
 function toast(msg, err) {
   const t = $("#toast");
-  t.textContent = msg; t.style.display = "block"; t.className = err ? "err" : "";
-  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", 12000);
+  t.textContent = msg; t.className = err ? "err" : "";
+  t.style.display = "block";
+  clearTimeout(t._h); t._h = setTimeout(() => { t.style.display = "none"; }, 12000);
 }
 function canDeploy(r) {
   return state.deploy_enabled && /^[a-z0-9]{20,32}$/.test(r.project || "") && r.project !== "source";
@@ -840,7 +943,7 @@ function targetCell(r) {
   if (!r.target) return '<span class="dim">pending</span>';
   if (!r.target.target_tag) return `<span class="dim">${esc(r.target.note || "n/a")}</span>`;
   const version = r.target.target_version ? `<span class="sub">${esc(r.target.target_version)}</span>` : "";
-  return `<code>${esc(r.target.target_tag)}</code>${version}`;
+  return `<code translate="no">${esc(r.target.target_tag)}</code>${version}`;
 }
 function render() {
   const q = $("#q").value.toLowerCase(), only = $("#onlyUpd").checked;
@@ -853,27 +956,28 @@ function render() {
     const can = canDeploy(r), id = esc(r.container), st = rowStatus(r);
     const running = r.version || r.created || "";
     return `<tr class="${st === "UPDATE" ? "upd" : ""}">
-      <td>${can ? `<input type="checkbox" data-c="${id}" ${sel.has(r.container) ? "checked" : ""}>` : ""}</td>
-      <td>${can ? `<code>${esc(r.resource || r.project)}</code>` : `<span class="dim">${esc(r.resource || "-")}</span>`}
+      <td>${can ? `<input type="checkbox" data-c="${id}" ${sel.has(r.container) ? "checked" : ""}
+             aria-label="Select ${id}">` : ""}</td>
+      <td>${can ? `<code translate="no">${esc(r.resource || r.project)}</code>` : `<span class="dim">${esc(r.resource || "—")}</span>`}
           <span class="sub">${id}</span></td>
-      <td><code>${esc(r.image)}</code></td>
+      <td><code translate="no">${esc(r.image)}</code></td>
       <td><span class="tag ${esc(r.policy)}">${esc(r.policy)}</span>
-          <span class="sub">${esc(running) || "-"}</span></td>
+          <span class="sub">${esc(running) || "—"}</span></td>
       <td>${targetCell(r)}</td>
       <td><span class="pill p-${esc(st)}">${esc(st)}</span></td>
       <td>${can
-        ? `<button class="row-btn" data-deploy="${esc(r.project)}"
-             title="Deploy now: re-pull the compose tag and recreate the container (compose is not edited)">update</button>
-           <button class="row-btn" data-pin="${id}"
-             title="Which versioned tag the floating tag points to today">exact tag</button>`
+        ? `<button class="row-btn" type="button" data-deploy="${esc(r.project)}"
+             title="Deploy now: re-pull the compose tag and recreate the container (the compose file is not edited)">Update</button>
+           <button class="row-btn" type="button" data-pin="${id}"
+             title="Which versioned tag the floating tag points to today">Exact Tag</button>`
         : `<span class="dim">${esc(r.note || "not deployable")}</span>`}</td>
     </tr>`;
-  }).join("") : `<tr><td colspan="7" class="dim">nothing here.</td></tr>`;
+  }).join("") : `<tr><td colspan="7" class="dim">No rows match the current filter.</td></tr>`;
   const outdated = rows.filter(r => rowStatus(r) === "UPDATE").length;
-  $("#targetHead").textContent = state.level === "current" ? "target" : "target (" + LEVEL_NAMES[state.level] + ")";
-  $("#meta").textContent = `${outdated} of ${rows.length} outdated - checked ${state.checked_at || "-"} (${state.duration ?? "?"}s)`;
+  $("#targetHead").textContent = state.level === "current" ? "Target" : "Target (" + LEVEL_NAMES[state.level] + ")";
+  $("#meta").textContent = `${num.format(outdated)} of ${num.format(rows.length)} outdated · checked ${fmtTime(state.checked_at_epoch, state.checked_at)} (${state.duration ?? "?"}s)`;
   $("#deployAll").disabled = sel.size === 0 || !state.deploy_enabled;
-  $("#deployAll").textContent = sel.size ? `Update selected (${sel.size})` : "Update selected";
+  $("#deployAll").textContent = sel.size ? `Update Selected (${sel.size})` : "Update Selected";
 }
 function renderConfig() {
   const c = state.config || {};
@@ -891,21 +995,27 @@ async function fetchState() {
     rows = state.rows || [];
     if ($("#level").value !== state.level) $("#level").value = state.level;
     if (state.deploy_hint) { $("#banner").textContent = state.deploy_hint; $("#banner").style.display = "block"; }
-    render(); renderConfig();
-  } catch (e) { toast("could not read state: " + e, true); }
+    render(); renderConfig(); syncUrl();
+  } catch (e) { toast("Could not read state: " + e, true); }
   const busy = state.checking || state.resolving;
-  if (state.checking) { $("#check").disabled = true; $("#check").textContent = "checking..."; }
-  else { $("#check").disabled = false; $("#check").textContent = "Check now"; }
+  if (state.checking) { $("#check").disabled = true; $("#check").textContent = "Checking…"; }
+  else { $("#check").disabled = false; $("#check").textContent = "Check Now"; }
   if (busy) setTimeout(fetchState, 2500);
 }
 async function doDeploy(uuids) {
-  toast("triggering deploy: " + uuids.join(", "));
+  toast("Deploying " + uuids.length + " resource(s)…");
   const res = await fetch("api/deploy", {method: "POST", headers: {"Content-Type": "application/json"},
                                          body: JSON.stringify({uuids})});
   const data = await res.json();
-  const failed = (data.results || []).filter(x => !x.ok);
-  toast((data.results || []).map(x => `${x.uuid}: ${x.ok ? "ok" : "failed"} (${x.status}) ${x.message}`).join("\n\n"),
-        failed.length > 0);
+  const results = data.results || [];
+  const failed = results.filter(x => !x.ok);
+  const ok = results.length - failed.length;
+  toast(failed.length
+    ? `Deploy failed for ${failed.length} of ${results.length}:\n\n` +
+      failed.map(x => `${x.uuid} (HTTP ${x.status}): ${x.message}`).join("\n\n") +
+      "\n\nCheck /api/state for the deployment log, or open the resource in Coolify."
+    : `Deploy triggered for ${ok} resource(s). Coolify is pulling now; run Check Now in a minute to confirm.`,
+    failed.length > 0);
 }
 $("#check").onclick = async () => { $("#check").disabled = true; await fetch("api/check", {method: "POST"}); setTimeout(fetchState, 1200); };
 $("#level").onchange = async e => {
@@ -913,8 +1023,8 @@ $("#level").onchange = async e => {
                             body: JSON.stringify({level: e.target.value})});
   setTimeout(fetchState, 800);
 };
-$("#q").oninput = render;
-$("#onlyUpd").onchange = render;
+$("#q").oninput = () => { render(); syncUrl(); };
+$("#onlyUpd").onchange = () => { render(); syncUrl(); };
 $("#all").onchange = e => {
   sel.clear();
   if (e.target.checked) document.querySelectorAll("[data-c]").forEach(c => sel.add(c.dataset.c));
@@ -925,7 +1035,7 @@ document.addEventListener("change", e => {
   if (!name) return;
   e.target.checked ? sel.add(name) : sel.delete(name);
   $("#deployAll").disabled = sel.size === 0 || !state.deploy_enabled;
-  $("#deployAll").textContent = sel.size ? `Update selected (${sel.size})` : "Update selected";
+  $("#deployAll").textContent = sel.size ? `Update Selected (${sel.size})` : "Update Selected";
 });
 document.addEventListener("click", async e => {
   const deployBtn = e.target.closest("[data-deploy]");
@@ -933,56 +1043,76 @@ document.addEventListener("click", async e => {
   const pinBtn = e.target.closest("[data-pin]");
   if (!pinBtn) return;
   const name = pinBtn.dataset.pin;
-  pinBtn.disabled = true; pinBtn.textContent = "...";
+  pinBtn.disabled = true; pinBtn.textContent = "…";
   try {
     const res = await fetch("api/pin", {method: "POST", headers: {"Content-Type": "application/json"},
                                         body: JSON.stringify({container: name})});
     const pin = await res.json();
-    toast(pin.error ? `${name}: ${pin.error}`
-                    : `${name}\n${pin.image}\n\nexact tag for the current digest: ${pin.matches.length ? pin.matches.join("  |  ") : "none (project publishes channels only)"}\n(digest ${pin.digest})`);
-  } finally { pinBtn.disabled = false; pinBtn.textContent = "exact tag"; }
+    toast(pin.error
+      ? `${name}: ${pin.error}. Try Check Now first — pin only works on a container from the last check.`
+      : `${pin.image}\n\nExact tag for the current digest: ${pin.matches.length ? pin.matches.join("  |  ") : "none (project publishes channels only)"}\nDigest: ${pin.digest}\n\nCopy that tag into your compose if you want to pin it.`);
+  } catch (e) { toast("Could not resolve the exact tag: " + e, true); }
+  finally { pinBtn.disabled = false; pinBtn.textContent = "Exact Tag"; }
 });
-function closeModal() { $("#modal").classList.remove("open"); }
-function openModal(items) {
+
+const deployDialog = $("#deployDialog"), helpDialog = $("#helpDialog");
+$("#help").onclick = () => openDialog(helpDialog);
+$("#helpClose").onclick = () => closeDialog(helpDialog);
+helpDialog.addEventListener("close", () => { if (lastFocus && lastFocus.focus) lastFocus.focus(); });
+deployDialog.addEventListener("close", () => { if (lastFocus && lastFocus.focus) lastFocus.focus(); });
+function openDeployDialog(items) {
   $("#mRows").innerHTML = items.map(it => it.containers.map(c => {
     const from = c.running || "unknown";
     const to = c.next || "unknown";
     const same = from && to && from === to;
     return `<tr>
-      <td><code>${esc(it.resource)}</code><span class="sub">${esc(c.container)}</span></td>
-      <td><code>${esc(c.image)}</code></td>
+      <td><code translate="no">${esc(it.resource)}</code><span class="sub">${esc(c.container)}</span></td>
+      <td><code translate="no">${esc(c.image)}</code></td>
       <td>${esc(from)}<span class="arrow">→</span><b>${esc(to)}</b>
-          ${same ? '<span class="warn"> (same version, container only recreated)</span>' : ''}</td>
+          ${same ? '<span class="warn"> (same version, container recreated only)</span>' : ''}</td>
     </tr>`;
   }).join("")).join("");
   const n = items.length;
-  $("#mTitle").textContent = `Deploy ${n} resource${n > 1 ? "s" : ""}?`;
-  $("#mGo").textContent = `Deploy ${n}`;
+  $("#mTitle").textContent = `Deploy ${n} Resource${n > 1 ? "s" : ""}?`;
+  $("#mGo").textContent = `Deploy ${n} Resource${n > 1 ? "s" : ""}`;
   $("#mHint").textContent = "Coolify re-pulls the compose tag; the compose file is not changed.";
-  $("#modal").dataset.uuids = JSON.stringify(items.map(i => i.uuid));
-  $("#modal").classList.add("open");
+  deployDialog.dataset.uuids = JSON.stringify(items.map(i => i.uuid));
+  openDialog(deployDialog);
+  $("#mGo").focus();
 }
-$("#mCancel").onclick = closeModal;
-$("#modal").onclick = e => { if (e.target.id === "modal") closeModal(); };
-document.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
+$("#mCancel").onclick = () => closeDialog(deployDialog);
 $("#mGo").onclick = () => {
-  const uuids = JSON.parse($("#modal").dataset.uuids || "[]");
-  closeModal();
+  const uuids = JSON.parse(deployDialog.dataset.uuids || "[]");
+  closeDialog(deployDialog);
   doDeploy(uuids);
 };
 $("#deployAll").onclick = async () => {
   const uuids = [...new Set(rows.filter(r => sel.has(r.container) && canDeploy(r)).map(r => r.project))];
   if (!uuids.length) return;
-  toast("resolving what will change...");
+  toast("Resolving what will change…");
   try {
     const res = await fetch("api/preview", {method: "POST", headers: {"Content-Type": "application/json"},
                                             body: JSON.stringify({uuids})});
     const data = await res.json();
-    if (!data.items || !data.items.length) return toast("nothing to deploy", true);
-    openModal(data.items);
-  } catch (e) { toast("preview failed: " + e, true); }
+    if (!data.items || !data.items.length) return toast("Nothing to deploy from the current selection.", true);
+    openDeployDialog(data.items);
+  } catch (e) { toast("Could not build the preview: " + e, true); }
 };
-fetchState();
+
+// state in the URL: ?level=minor&q=seerr&outdated=0
+const params = new URLSearchParams(location.search);
+if (params.get("q")) $("#q").value = params.get("q");
+if (params.get("outdated") === "0") $("#onlyUpd").checked = false;
+const initialLevel = params.get("level");
+if (initialLevel && ["current", "major", "minor"].includes(initialLevel)) {
+  $("#level").value = initialLevel;
+}
+fetchState().then(() => {
+  if (initialLevel && state.level !== initialLevel) {
+    fetch("api/level", {method: "POST", headers: {"Content-Type": "application/json"},
+                        body: JSON.stringify({level: initialLevel})}).then(() => setTimeout(fetchState, 800));
+  }
+});
 </script></body></html>
 """
 
