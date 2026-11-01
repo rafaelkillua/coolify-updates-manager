@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 APP_NAME = "coolify-updates-manager"
 
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -546,6 +546,7 @@ STATE = {
     "pins": {},
     "level": "current",
     "resolved_at": {},
+    "schema": 3,          # bump when the row shape changes: old rows are dropped
 }
 CHECKING = threading.Event()
 RESOLVING = threading.Event()
@@ -554,25 +555,43 @@ LOCK = threading.Lock()
 
 
 def load_state():
+    stale_rows = False
     try:
         with open(STATE_FILE) as handle:
             disk = json.load(handle)
+        stale_rows = disk.get("schema") != STATE["schema"]
         STATE.update({k: v for k, v in disk.items() if k in STATE})
     except Exception:
         pass
     if STATE.get("level") not in LEVELS:
         STATE["level"] = "current"
+    if stale_rows:
+        # rows written by an older version may miss fields (url, deploy_uuid): a
+        # fresh check is cheaper than showing stale or half-empty columns
+        STATE.update(rows=[], counts={"UPDATE": 0, "ok": 0, "??": 0}, checked_at=None,
+                     checked_at_epoch=None, pins={}, resolved_at={})
+    return stale_rows
+
+
+SAVE_LOCK = threading.Lock()
 
 
 def save_state():
+    # the check thread, the resolve thread and the HTTP handlers all save: one at a
+    # time, with a per-call temp file, otherwise os.replace races itself
+    tmp = f"{STATE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
-        os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as handle:
-            json.dump(STATE, handle)
-        os.replace(tmp, STATE_FILE)
+        with SAVE_LOCK:
+            os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
+            with open(tmp, "w") as handle:
+                json.dump(STATE, handle)
+            os.replace(tmp, STATE_FILE)
     except Exception as exc:  # noqa: BLE001
         print(f"warn: could not write state file: {exc}", flush=True)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def container_url(inspect):
@@ -835,7 +854,41 @@ def deploy(uuids):
         if entry["ok"]:
             threading.Thread(target=_run_deploy_job, args=(job,), daemon=True).start()
         results.append(entry)
+    if any(entry["ok"] for entry in results):
+        start_job_poller()
     return results
+
+
+JOB_POLLER = threading.Event()
+
+
+def start_job_poller():
+    """Keep polling deploy jobs even if no browser has the progress dialog open.
+
+    When every job reaches a terminal state the poller stops; poll_deploy_jobs()
+    triggers a fresh check at that point, so the table shows the new versions.
+    """
+    if JOB_POLLER.is_set():
+        return False
+    JOB_POLLER.set()
+
+    def work():
+        try:
+            while True:
+                jobs = list(DEPLOY_JOBS.values())
+                if not jobs:
+                    break
+                poll_deploy_jobs()
+                if all(j.get("status") in TERMINAL_JOB for j in jobs):
+                    break
+                time.sleep(3)
+        except Exception as exc:  # noqa: BLE001
+            print(f"warn: job poller stopped: {exc}", flush=True)
+        finally:
+            JOB_POLLER.clear()
+
+    threading.Thread(target=work, daemon=True).start()
+    return True
 
 
 def _run_deploy_job(job):
@@ -1629,6 +1682,8 @@ fetchState().then(() => {
                         body: JSON.stringify({level: initialLevel})}).then(() => setTimeout(fetchState, 800));
   }
 });
+// background checks and deploys change the data server side: keep the table fresh
+setInterval(() => { if (!document.querySelector("dialog[open]")) fetchState(); }, 15000);
 </script></body></html>
 """
 
@@ -1737,8 +1792,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    load_state()
-    if STATE["rows"]:
+    if load_state() or not STATE["rows"]:
+        run_check()       # first run or rows from an older version: build them now
+    else:
         warm_versions()   # cached rows from a previous run: warm the version data
     print(f"{APP_NAME} {VERSION} listening on http://{BIND}:{PORT} | coolify={COOLIFY_API_URL or '-'} "
           f"| state={STATE_FILE} | level={STATE['level']}", flush=True)
