@@ -64,6 +64,7 @@ Everything is optional; the defaults give you a read-only dashboard.
 | `UPDATES_TIMEOUT` | `60` | — | per-request timeout, seconds |
 | `UPDATES_TAGS_TTL` | `21600` | — | how long a registry tag list is cached, seconds |
 | `UPDATES_DIGEST_TTL` | `900` | — | how long a manifest digest is cached, seconds |
+| `UPDATES_PREVIEW_TTL` | `300` | — | how long a computed deploy-dialog preview is reused for the same selection |
 
 ### Which ones do I actually need?
 
@@ -116,7 +117,7 @@ Open `http://localhost:8799`.
 | GET | `/api/state` | last result, selected level, config, deploy capability |
 | POST | `/api/check` | start a full check (202, or 409 when one is running) |
 | POST | `/api/level` | `{"level": "current"\|"major"\|"minor"}` — switch the target |
-| POST | `/api/preview` | `{"uuids": ["…"]}` — running version → version after the pull, per container |
+| POST | `/api/preview` | `{"uuids": ["…"], "force": false}` — running version → version after the pull, per container (cached per selection for `UPDATES_PREVIEW_TTL`) |
 | POST | `/api/deploy` | `{"uuids": ["<coolify uuid>"]}` — deploy in Coolify |
 | POST | `/api/pin` | `{"container": "<name>"}` — versioned tag matching the current digest |
 

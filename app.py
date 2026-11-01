@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.1"
+VERSION = "2.3.0"
 APP_NAME = "coolify-updates-manager"
 
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -45,6 +45,7 @@ WORKERS = int(os.environ.get("UPDATES_WORKERS", "8"))
 CHECK_TIMEOUT = int(os.environ.get("UPDATES_TIMEOUT", "60"))
 TAGS_TTL = int(os.environ.get("UPDATES_TAGS_TTL", "21600"))      # registry tag list
 DIGEST_TTL = int(os.environ.get("UPDATES_DIGEST_TTL", "900"))    # manifest digest
+PREVIEW_TTL = int(os.environ.get("UPDATES_PREVIEW_TTL", "300"))  # deploy dialog preview
 
 DEPLOY_HINT = "" if COOLIFY_TOKEN else "deploy disabled: COOLIFY_TOKEN is not set"
 
@@ -605,6 +606,8 @@ def run_check():
                 resolve_rows(STATE["level"])
         except Exception as exc:  # noqa: BLE001
             STATE.update(error=f"{type(exc).__name__}: {exc}")
+        with LOCK:
+            _preview_cache.clear()   # rows changed, any cached preview is stale
         save_state()
         CHECKING.clear()
 
@@ -658,6 +661,7 @@ def deploy(uuids):
             entry["message"] = f"{type(exc).__name__}: {exc}"
         with LOCK:
             DEPLOY_LOG[uuid] = {"at": time.strftime("%H:%M:%S"), "ok": entry["ok"], "message": entry["message"][:200]}
+            _preview_cache.clear()   # a deploy may change what the tags resolve to
         results.append(entry)
     return results
 
@@ -667,8 +671,25 @@ def deployable(row):
     return bool(COOLIFY_TOKEN) and bool(re.fullmatch(r"[a-z0-9]{20,32}", project)) and project != "source"
 
 
-def preview(uuids):
-    """What each selected resource will become after a deploy."""
+_preview_cache = {}
+
+
+def preview(uuids, force=False):
+    """What each selected resource will become after a deploy.
+
+    Cached per selection for PREVIEW_TTL seconds: reopening the dialog or
+    re-clicking Update Selected does not resolve versions again. `force`
+    bypasses the cache (the Refresh button in the dialog).
+    """
+    key = ",".join(sorted(uuids))
+    now = time.time()
+    with LOCK:
+        hit = _preview_cache.get(key)
+        if hit and not force and now - hit[0] < PREVIEW_TTL:
+            payload = dict(hit[1])
+            payload["cached"] = True
+            payload["age"] = round(now - hit[0])
+            return payload
     items = {}
     for row in STATE["rows"]:
         uuid = row.get("project") or ""
@@ -687,7 +708,10 @@ def preview(uuids):
             "running": version_running(row),
             "next": version_after_pull(row),
         })
-    return {"items": [items[k] for k in uuids if k in items]}
+    payload = {"items": [items[k] for k in uuids if k in items], "cached": False, "age": 0, "ttl": PREVIEW_TTL}
+    with LOCK:
+        _preview_cache[key] = (time.time(), payload)
+    return payload
 
 
 def config_view():
@@ -700,6 +724,7 @@ def config_view():
         "timeout": CHECK_TIMEOUT,
         "tags_ttl": TAGS_TTL,
         "digest_ttl": DIGEST_TTL,
+        "preview_ttl": PREVIEW_TTL,
         "bind": f"{BIND}:{PORT}",
     }
 
@@ -839,6 +864,7 @@ PAGE = r"""<!doctype html>
       <tbody id="mRows"></tbody></table></div>
     <div class="foot">
       <span class="hint" id="mHint"></span>
+      <button id="mRefresh" type="button">Refresh</button>
       <button id="mCancel" type="button">Cancel</button>
       <button class="primary" id="mGo" type="button">Deploy</button>
     </div>
@@ -912,6 +938,7 @@ PAGE = r"""<!doctype html>
 <div id="toast" role="status" aria-live="polite"></div>
 <script>
 let rows = [], state = {}, sel = new Set(), lastFocus = null, previewBusy = false;
+const PREVIEW_TTL = 300;
 const $ = s => document.querySelector(s);
 const esc = s => (s ?? "").toString().replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const LEVEL_NAMES = {current: "current tag", major: "major line", minor: "minor line"};
@@ -1097,7 +1124,8 @@ $("#help").onclick = () => openDialog(helpDialog);
 $("#helpClose").onclick = () => closeDialog(helpDialog);
 helpDialog.addEventListener("close", () => { if (lastFocus && lastFocus.focus) lastFocus.focus(); });
 deployDialog.addEventListener("close", () => { if (lastFocus && lastFocus.focus) lastFocus.focus(); });
-function openDeployDialog(items) {
+function fillDeployDialog(data) {
+  const items = data.items || [];
   $("#mRows").innerHTML = items.map(it => it.containers.map(c => {
     const from = c.running || "unknown";
     const to = c.next || "unknown";
@@ -1112,11 +1140,39 @@ function openDeployDialog(items) {
   const n = items.length;
   $("#mTitle").textContent = `Deploy ${n} Resource${n > 1 ? "s" : ""}?`;
   $("#mGo").textContent = `Deploy ${n} Resource${n > 1 ? "s" : ""}`;
-  $("#mHint").textContent = "Coolify re-pulls the compose tag; the compose file is not changed.";
+  const when = data.cached
+    ? `Preview reused from ${data.age}s ago (kept for ${data.ttl || PREVIEW_TTL}s).`
+    : `Preview computed now (kept for ${data.ttl || PREVIEW_TTL}s).`;
+  $("#mHint").textContent = `${when} Resources with several containers deploy as a whole; ` +
+    "Coolify re-pulls the compose tag and the compose file is not changed.";
   deployDialog.dataset.uuids = JSON.stringify(items.map(i => i.uuid));
+}
+function openDeployDialog(data) {
+  fillDeployDialog(data);
   openDialog(deployDialog);
   $("#mGo").focus();
 }
+$("#mRefresh").onclick = async () => {
+  const uuids = JSON.parse(deployDialog.dataset.uuids || "[]");
+  if (!uuids.length) return;
+  const btn = $("#mRefresh");
+  btn.disabled = true;
+  btn.setAttribute("aria-busy", "true");
+  btn.innerHTML = `<span class="spin" aria-hidden="true"></span>Refresh`;
+  try {
+    const res = await fetch("api/preview", {method: "POST", headers: {"Content-Type": "application/json"},
+                                            body: JSON.stringify({uuids, force: true})});
+    const data = await res.json();
+    if (data.items && data.items.length) fillDeployDialog(data);
+    else toast("Nothing to deploy from the current selection.", true);
+  } catch (e) {
+    toast("Could not refresh the preview: " + e, true);
+  } finally {
+    btn.disabled = false;
+    btn.removeAttribute("aria-busy");
+    btn.textContent = "Refresh";
+  }
+};
 $("#mCancel").onclick = () => closeDialog(deployDialog);
 $("#mGo").onclick = () => {
   const uuids = JSON.parse(deployDialog.dataset.uuids || "[]");
@@ -1136,7 +1192,7 @@ $("#deployAll").onclick = async () => {
     if (!data.items || !data.items.length) {
       toast("Nothing to deploy from the current selection.", true);
     } else {
-      openDeployDialog(data.items);
+      openDeployDialog(data);
     }
   } catch (e) {
     toast("Could not build the preview: " + e, true);
@@ -1232,7 +1288,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._fail(400, "provide a valid uuid list")
             if path == "/api/preview":
                 try:
-                    return self._send(200, json.dumps(preview(uuids)))
+                    return self._send(200, json.dumps(preview(uuids, force=bool(body.get("force")))))
                 except Exception as exc:  # noqa: BLE001
                     return self._fail(502, f"{type(exc).__name__}: {exc}")
             if not COOLIFY_TOKEN:
