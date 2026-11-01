@@ -174,6 +174,13 @@ daemon allows.
   single channel and no versioned tags get an `??` with a note instead of a
   suggested tag.
 
+## Contributing
+
+`AGENTS.md` documents the architecture, the caching rules, the threading model and
+the Coolify/Docker behaviours that are easy to break. Read it before changing
+`app.py` — it explains why things are the way they are, including the parts that
+look odd (like pulling images from the panel before deploying).
+
 ## License
 
 MIT.
